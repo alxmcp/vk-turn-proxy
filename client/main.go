@@ -20,6 +20,7 @@ import (
 	"github.com/pion/turn/v5"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -34,9 +35,10 @@ import (
 type getCredsFunc func(string) (string, string, string, error)
 
 func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, error) {
+	profile := getRandomProfile()
+	log.Printf("Using User-Agent: %s\n", profile.UserAgent)
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-
 		client := &http.Client{
 			Timeout: 20 * time.Second,
 			Transport: &http.Transport{
@@ -47,12 +49,13 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 			},
 		}
 		defer client.CloseIdleConnections()
+
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
 			return nil, err
 		}
 
-		req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0")
+		req.Header.Add("User-Agent", profile.UserAgent)
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 		httpResp, err := client.Do(req)
@@ -95,7 +98,7 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 
 	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
 
-	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token1)
+	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, generateName(), token1)
 	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
 
 	resp, err = doRequest(data, url)
@@ -137,7 +140,8 @@ func getYandexCreds(link string) (string, string, string, error) {
 	const debug = false
 	const telemostConfHost = "cloud-api.yandex.ru"
 	telemostConfPath := fmt.Sprintf("%s%s%s", "/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F", link, "/connection?next_gen_media_platform_allowed=false")
-	const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
+	profile := getRandomProfile()
+	userAgent := profile.UserAgent
 
 	type ConferenceResponse struct {
 		URI                 string `json:"uri"`
@@ -251,13 +255,14 @@ func getYandexCreds(link string) (string, string, string, error) {
 	}
 
 	endpoint := "https://" + telemostConfHost + telemostConfPath
+	tr := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		},
+		Timeout:   20 * time.Second,
+		Transport: tr,
 	}
 	defer client.CloseIdleConnections()
 	req, err := http.NewRequest("GET", endpoint, nil)
@@ -316,14 +321,14 @@ func getYandexCreds(link string) (string, string, string, error) {
 		UID: uuid.New().String(),
 		Hello: HelloPayload{
 			ParticipantMeta: PartMeta{
-				Name:        "Гость",
+				Name:        generateName(),
 				Role:        "SPEAKER",
 				Description: "",
 				SendAudio:   false,
 				SendVideo:   false,
 			},
 			ParticipantAttributes: PartAttrs{
-				Name:        "Гость",
+				Name:        generateName(),
 				Role:        "SPEAKER",
 				Description: "",
 			},
@@ -451,6 +456,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 }
 
 func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c chan<- error) {
+	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 	var err error = nil
 	defer func() { c <- err }()
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
@@ -583,6 +589,7 @@ type turnParams struct {
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
+	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 	var err error = nil
 	defer func() { c <- err }()
 	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
@@ -806,6 +813,7 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 }
 
 func main() { //nolint:cyclop
+	rand.Seed(time.Now().UnixNano())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signalChan := make(chan os.Signal, 1)
