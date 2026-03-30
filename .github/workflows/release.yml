@@ -205,25 +205,51 @@ jobs:
           BUMP: ${{ steps.meta.outputs.bump }}
           RANGE: ${{ steps.meta.outputs.range }}
         run: |
+          strip_prefix() {
+            sed -E 's/^(feat|fix|break)([(!:]|[[:space:]])+[[:space:]]*//I'
+          }
+
+          FEATURES="$(git log --no-merges --format='%s (%h)' "$RANGE" | grep -Ei '^feat([(:! ]|$)' | strip_prefix | LC_ALL=C sort -f || true)"
+          FIXES="$(git log --no-merges --format='%s (%h)' "$RANGE" | grep -Ei '^fix([(:! ]|$)' | strip_prefix | LC_ALL=C sort -f || true)"
+          BREAKING="$(git log --no-merges --format='%s (%h)' "$RANGE" | grep -Ei '^break([(:! ]|$)' | strip_prefix | LC_ALL=C sort -f || true)"
+
           {
             echo "body_path=release-notes.md"
           } >> "$GITHUB_OUTPUT"
 
           {
-            echo "## Changes"
+            echo "## Изменения"
             echo
-            echo "Release: \`$NEXT_TAG\`"
-            echo "Version bump: \`$BUMP\`"
+            echo "Релиз: \`$NEXT_TAG\`"
             echo
 
             if [ -n "$PREVIOUS_TAG" ]; then
-              echo "Changes since \`$PREVIOUS_TAG\`:"
+              echo "Изменения с версии \`$PREVIOUS_TAG\`:"
               echo
-              git log --no-merges --format='- %s (%h)' "$RANGE"
             else
-              echo "Initial semantic release from repository history:"
+              echo "Первый семантический релиз по истории репозитория:"
               echo
-              git log --no-merges --format='- %s (%h)' "$RANGE"
+            fi
+
+            if [ -n "$BREAKING" ]; then
+              echo "### Несовместимые изменения"
+              echo
+              printf '%s\n' "$BREAKING" | sed 's/^/- /'
+              echo
+            fi
+
+            if [ -n "$FEATURES" ]; then
+              echo "### Новые функции"
+              echo
+              printf '%s\n' "$FEATURES" | sed 's/^/- /'
+              echo
+            fi
+
+            if [ -n "$FIXES" ]; then
+              echo "### Исправление багов"
+              echo
+              printf '%s\n' "$FIXES" | sed 's/^/- /'
+              echo
             fi
           } > release-notes.md
 
@@ -245,5 +271,5 @@ jobs:
       - name: Skip release when no semantic commit is found
         if: steps.meta.outputs.should_release != 'true'
         run: |
-          echo "No new semantic release created."
-          echo "Add a commit starting with break, feat, or fix after the latest tag."
+          echo "Новый релиз не создан."
+          echo "После последнего тега не найдено коммитов с префиксами break, feat или fix."
