@@ -10,14 +10,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/bschaatsbergen/dnsdialer"
-	"github.com/cbeuw/connutil"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
-	"github.com/pion/logging"
-	"github.com/pion/turn/v5"
 	"io"
 	"log"
 	"math/rand"
@@ -30,6 +22,17 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cacggghp/vk-turn-proxy/tcputil"
+	"github.com/cbeuw/connutil"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/pion/dtls/v3"
+	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	"github.com/pion/logging"
+	"github.com/pion/turn/v5"
+	"github.com/xtaci/smux"
 )
 
 type getCredsFunc func(string) (string, string, string, error)
@@ -838,6 +841,7 @@ func main() { //nolint:cyclop
 	n := flag.Int("n", 0, "connections to TURN (default 16 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
+	tcpMode := flag.Bool("tcp", false, "TCP mode: forward TCP connections (for VLESS) instead of UDP packets")
 	flag.Parse()
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -885,6 +889,11 @@ func main() { //nolint:cyclop
 		link,
 		*udp,
 		getCreds,
+	}
+
+	if *tcpMode {
+		runTCPMode(ctx, params, peer, *listen)
+		return
 	}
 
 	listenConnChan := make(chan net.PacketConn)
@@ -943,4 +952,239 @@ func main() { //nolint:cyclop
 	}
 
 	wg1.Wait()
+}
+
+// runTCPMode implements TCP forwarding mode for VLESS.
+// It establishes a DTLS tunnel through TURN, then creates a KCP+smux session
+// on top, and forwards incoming TCP connections as smux streams.
+func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		err := runTCPSession(ctx, tp, peer, listenAddr)
+		if err != nil {
+			log.Printf("TCP session error: %s, reconnecting...", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func runTCPSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string) error {
+	// 1. Get TURN credentials
+	user, pass, url, err := tp.getCreds(tp.link)
+	if err != nil {
+		return fmt.Errorf("get TURN creds: %w", err)
+	}
+	urlhost, urlport, err := net.SplitHostPort(url)
+	if err != nil {
+		return fmt.Errorf("parse TURN addr: %w", err)
+	}
+	if tp.host != "" {
+		urlhost = tp.host
+	}
+	if tp.port != "" {
+		urlport = tp.port
+	}
+	turnServerAddr := net.JoinHostPort(urlhost, urlport)
+	turnServerUdpAddr, err := net.ResolveUDPAddr("udp", turnServerAddr)
+	if err != nil {
+		return fmt.Errorf("resolve TURN addr: %w", err)
+	}
+	turnServerAddr = turnServerUdpAddr.String()
+	fmt.Println(turnServerUdpAddr.IP)
+
+	// 2. Connect to TURN server
+	var turnConn net.PacketConn
+	ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel1()
+	if tp.udp {
+		conn, err := net.DialUDP("udp", nil, turnServerUdpAddr)
+		if err != nil {
+			return fmt.Errorf("dial TURN (udp): %w", err)
+		}
+		defer conn.Close()
+		turnConn = &connectedUDPConn{conn}
+	} else {
+		var d net.Dialer
+		conn, err := d.DialContext(ctx1, "tcp", turnServerAddr)
+		if err != nil {
+			return fmt.Errorf("dial TURN (tcp): %w", err)
+		}
+		defer conn.Close()
+		turnConn = turn.NewSTUNConn(conn)
+	}
+
+	// 3. Allocate TURN relay
+	var addrFamily turn.RequestedAddressFamily
+	if peer.IP.To4() != nil {
+		addrFamily = turn.RequestedAddressFamilyIPv4
+	} else {
+		addrFamily = turn.RequestedAddressFamilyIPv6
+	}
+	cfg := &turn.ClientConfig{
+		STUNServerAddr:         turnServerAddr,
+		TURNServerAddr:         turnServerAddr,
+		Conn:                   turnConn,
+		Username:               user,
+		Password:               pass,
+		RequestedAddressFamily: addrFamily,
+		LoggerFactory:          logging.NewDefaultLoggerFactory(),
+	}
+	turnClient, err := turn.NewClient(cfg)
+	if err != nil {
+		return fmt.Errorf("create TURN client: %w", err)
+	}
+	defer turnClient.Close()
+	if err = turnClient.Listen(); err != nil {
+		return fmt.Errorf("TURN listen: %w", err)
+	}
+	relayConn, err := turnClient.Allocate()
+	if err != nil {
+		return fmt.Errorf("TURN allocate: %w", err)
+	}
+	defer relayConn.Close()
+	log.Printf("relayed-address=%s", relayConn.LocalAddr().String())
+
+	// 4. Establish DTLS over TURN relay
+	certificate, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		return fmt.Errorf("generate cert: %w", err)
+	}
+
+	// Create a connected PacketConn for DTLS: relay writes go to peer
+	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer}
+
+	dtlsConfig := &dtls.Config{
+		Certificates:          []tls.Certificate{certificate},
+		InsecureSkipVerify:    true,
+		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
+		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
+	}
+
+	dtlsConn, err := dtls.Client(dtlsPC, peer, dtlsConfig)
+	if err != nil {
+		return fmt.Errorf("DTLS client create: %w", err)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel2()
+	if err = dtlsConn.HandshakeContext(ctx2); err != nil {
+		dtlsConn.Close()
+		return fmt.Errorf("DTLS handshake: %w", err)
+	}
+	defer dtlsConn.Close()
+	log.Printf("DTLS connection established")
+
+	// 5. Create KCP session over DTLS
+	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
+	if err != nil {
+		return fmt.Errorf("KCP session: %w", err)
+	}
+	defer kcpSess.Close()
+	log.Printf("KCP session established")
+
+	// 6. Create smux client session over KCP
+	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
+	if err != nil {
+		return fmt.Errorf("smux client: %w", err)
+	}
+	defer smuxSess.Close()
+	log.Printf("smux session established")
+
+	// 7. Listen for TCP connections and forward through smux
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("TCP listen: %w", err)
+	}
+	context.AfterFunc(ctx, func() { listener.Close() })
+	log.Printf("TCP mode: listening on %s", listenAddr)
+
+	var wg sync.WaitGroup
+	for {
+		tcpConn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				wg.Wait()
+				return nil
+			default:
+			}
+			if smuxSess.IsClosed() {
+				wg.Wait()
+				return fmt.Errorf("smux session closed")
+			}
+			log.Printf("TCP accept error: %s", err)
+			continue
+		}
+
+		wg.Add(1)
+		go func(tc net.Conn) {
+			defer wg.Done()
+			defer tc.Close()
+
+			stream, err := smuxSess.OpenStream()
+			if err != nil {
+				log.Printf("smux open stream error: %s", err)
+				return
+			}
+			defer stream.Close()
+
+			pipe(ctx, tc, stream)
+		}(tcpConn)
+	}
+}
+
+// relayPacketConn wraps a TURN relay PacketConn to direct all writes to the peer.
+type relayPacketConn struct {
+	relay net.PacketConn
+	peer  net.Addr
+}
+
+func (r *relayPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	return r.relay.ReadFrom(b)
+}
+
+func (r *relayPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	return r.relay.WriteTo(b, r.peer)
+}
+
+func (r *relayPacketConn) Close() error                       { return r.relay.Close() }
+func (r *relayPacketConn) LocalAddr() net.Addr                { return r.relay.LocalAddr() }
+func (r *relayPacketConn) SetDeadline(t time.Time) error      { return r.relay.SetDeadline(t) }
+func (r *relayPacketConn) SetReadDeadline(t time.Time) error  { return r.relay.SetReadDeadline(t) }
+func (r *relayPacketConn) SetWriteDeadline(t time.Time) error { return r.relay.SetWriteDeadline(t) }
+
+// pipe copies data bidirectionally between two connections.
+func pipe(ctx context.Context, c1, c2 net.Conn) {
+	ctx2, cancel := context.WithCancel(ctx)
+	context.AfterFunc(ctx2, func() {
+		c1.SetDeadline(time.Now())
+		c2.SetDeadline(time.Now())
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		io.Copy(c1, c2)
+	}()
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		io.Copy(c2, c1)
+	}()
+	wg.Wait()
+	c1.SetDeadline(time.Time{})
+	c2.SetDeadline(time.Time{})
 }
