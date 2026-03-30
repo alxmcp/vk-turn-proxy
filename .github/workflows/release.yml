@@ -261,5 +261,5 @@ jobs:
       - name: Skip release when no semantic commit is found
         if: steps.meta.outputs.should_release != 'true'
         run: |
-          echo "Новый релиз не создан."
-          echo "После последнего тега не найдено коммитов с префиксами break, feat или fix."
+          echo "Новый релиз не создан."
+          echo "После последнего тега не найдено коммитов с префиксами break, feat или fix."
