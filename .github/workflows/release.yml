@@ -146,26 +146,64 @@ jobs:
 
       - name: Prepare release metadata
         id: meta
-        env:
-          BRANCH_NAME: ${{ github.ref_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          SHORT_SHA="${COMMIT_SHA::7}"
-          TAG_NAME="auto-${BRANCH_NAME}-${SHORT_SHA}"
+          LATEST_TAG="$(git tag -l | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          PREFIX=""
+          BASE_VERSION="$LATEST_TAG"
+
+          if [ -z "$LATEST_TAG" ]; then
+            BASE_VERSION="0.0.0"
+          elif [ "${LATEST_TAG#v}" != "$LATEST_TAG" ]; then
+            PREFIX="v"
+            BASE_VERSION="${LATEST_TAG#v}"
+          fi
+
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+
+          if [ -n "$LATEST_TAG" ]; then
+            RANGE="$LATEST_TAG..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          COMMITS="$(git log --no-merges --format='%s' "$RANGE")"
+          BUMP=""
+
+          if printf '%s\n' "$COMMITS" | grep -Eiq '^break([(:! ]|$)'; then
+            BUMP="major"
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif printf '%s\n' "$COMMITS" | grep -Eiq '^feat([(:! ]|$)'; then
+            BUMP="minor"
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          elif printf '%s\n' "$COMMITS" | grep -Eiq '^fix([(:! ]|$)'; then
+            BUMP="patch"
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEXT_TAG="${PREFIX}${NEXT_VERSION}"
 
           {
-            echo "tag_name=$TAG_NAME"
-            echo "release_name=$TAG_NAME"
+            echo "previous_tag=$LATEST_TAG"
+            echo "range=$RANGE"
+            echo "bump=$BUMP"
+            echo "should_release=$([ -n "$BUMP" ] && echo true || echo false)"
+            echo "tag_name=$NEXT_TAG"
+            echo "release_name=$NEXT_TAG"
             echo "body_path=release-notes.md"
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes from commit messages
         id: notes
+        if: steps.meta.outputs.should_release == 'true'
         env:
-          BRANCH_NAME: ${{ github.ref_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
+          PREVIOUS_TAG: ${{ steps.meta.outputs.previous_tag }}
+          NEXT_TAG: ${{ steps.meta.outputs.tag_name }}
+          BUMP: ${{ steps.meta.outputs.bump }}
+          RANGE: ${{ steps.meta.outputs.range }}
         run: |
           {
             echo "body_path=release-notes.md"
@@ -174,22 +212,23 @@ jobs:
           {
             echo "## Changes"
             echo
-            echo "Branch: \`$BRANCH_NAME\`"
-            echo "Commit: \`${COMMIT_SHA}\`"
+            echo "Release: \`$NEXT_TAG\`"
+            echo "Version bump: \`$BUMP\`"
             echo
 
-            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
-              echo "Changes since \`${BEFORE_SHA::7}\`:"
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo "Changes since \`$PREVIOUS_TAG\`:"
               echo
-              git log --no-merges --format='- %s (%h)' "$BEFORE_SHA..$COMMIT_SHA"
+              git log --no-merges --format='- %s (%h)' "$RANGE"
             else
-              echo "Changes in this commit:"
+              echo "Initial semantic release from repository history:"
               echo
-              git log --no-merges --format='- %s (%h)' -n 1 "$COMMIT_SHA"
+              git log --no-merges --format='- %s (%h)' "$RANGE"
             fi
           } > release-notes.md
 
       - name: Create Release
+        if: steps.meta.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           # upload every file in dist/ including nested files
@@ -202,3 +241,9 @@ jobs:
           overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip release when no semantic commit is found
+        if: steps.meta.outputs.should_release != 'true'
+        run: |
+          echo "No new semantic release created."
+          echo "Add a commit starting with break, feat, or fix after the latest tag."
