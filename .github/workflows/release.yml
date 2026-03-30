@@ -222,9 +222,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           {
-            echo "## Изменения"
-            echo
-
             if [ -n "$BREAKING" ]; then
               echo "### Несовместимые изменения"
               echo
@@ -265,5 +262,5 @@ jobs:
       - name: Skip release when no semantic commit is found
         if: steps.meta.outputs.should_release != 'true'
         run: |
-          echo "Новый релиз не создан."
-          echo "После последнего тега не найдено коммитов с префиксами break, feat или fix."
+          echo "No new semantic release created."
+          echo "Add a commit starting with break, feat, or fix after the latest tag."
