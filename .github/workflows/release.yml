@@ -2,9 +2,9 @@ name: Release
 
 on:
   push:
-    # Trigger on tag pushes. Adjust pattern as needed (e.g. 'v*.*.*')
-    tags:
-      - '**'
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 jobs:
@@ -25,7 +25,7 @@ jobs:
             cgo: 0
           - goos: linux
             goarch: arm
-            goarm: '7'
+            goarm: "7"
             cgo: 0
           - goos: darwin
             goarch: amd64
@@ -58,7 +58,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.5'
+          go-version: "1.25.5"
 
       # Install Android NDK only for android rows
       - name: Setup Android NDK
@@ -114,7 +114,7 @@ jobs:
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
             -o "dist/client-${GOOS}-${GOARCH}${EXT}" \
             ./client
-          
+
           GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
             -o "dist/server-${GOOS}-${GOARCH}${EXT}" \
@@ -144,13 +144,29 @@ jobs:
         with:
           path: dist
 
+      - name: Prepare release metadata
+        id: meta
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          SHORT_SHA="${COMMIT_SHA::7}"
+          TAG_NAME="auto-${BRANCH_NAME}-${SHORT_SHA}"
+
+          {
+            echo "tag_name=$TAG_NAME"
+            echo "release_name=$TAG_NAME"
+            echo "body_path=release-notes.md"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Generate release notes from commit messages
         id: notes
         env:
-          CURRENT_TAG: ${{ github.ref_name }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          PREV_TAG="$(git tag --sort=-creatordate | grep -Fxv "$CURRENT_TAG" | head -n 1 || true)"
-
           {
             echo "body_path=release-notes.md"
           } >> "$GITHUB_OUTPUT"
@@ -158,15 +174,18 @@ jobs:
           {
             echo "## Changes"
             echo
+            echo "Branch: \`$BRANCH_NAME\`"
+            echo "Commit: \`${COMMIT_SHA}\`"
+            echo
 
-            if [ -n "$PREV_TAG" ]; then
-              echo "Changes since \`$PREV_TAG\`:"
+            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+              echo "Changes since \`${BEFORE_SHA::7}\`:"
               echo
-              git log --no-merges --format='- %s (%h)' "$PREV_TAG..$CURRENT_TAG"
+              git log --no-merges --format='- %s (%h)' "$BEFORE_SHA..$COMMIT_SHA"
             else
-              echo "First tagged release in this repository."
+              echo "Changes in this commit:"
               echo
-              git log --no-merges --format='- %s (%h)' "$CURRENT_TAG"
+              git log --no-merges --format='- %s (%h)' -n 1 "$COMMIT_SHA"
             fi
           } > release-notes.md
 
@@ -176,10 +195,10 @@ jobs:
           # upload every file in dist/ including nested files
           files: |
             dist/**
-          # make the release name/tag the pushed tag
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          body_path: ${{ steps.notes.outputs.body_path }}
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.release_name }}
+          body_path: ${{ steps.meta.outputs.body_path }}
           overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
