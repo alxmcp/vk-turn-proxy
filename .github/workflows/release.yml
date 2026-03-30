@@ -133,10 +133,42 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download build artifacts
         uses: actions/download-artifact@v7
         with:
           path: dist
+
+      - name: Generate release notes from commit messages
+        id: notes
+        env:
+          CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          PREV_TAG="$(git tag --sort=-creatordate | grep -Fxv "$CURRENT_TAG" | head -n 1 || true)"
+
+          {
+            echo "body_path=release-notes.md"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Changes"
+            echo
+
+            if [ -n "$PREV_TAG" ]; then
+              echo "Changes since \`$PREV_TAG\`:"
+              echo
+              git log --no-merges --format='- %s (%h)' "$PREV_TAG..$CURRENT_TAG"
+            else
+              echo "First tagged release in this repository."
+              echo
+              git log --no-merges --format='- %s (%h)' "$CURRENT_TAG"
+            fi
+          } > release-notes.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -147,6 +179,7 @@ jobs:
           # make the release name/tag the pushed tag
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.body_path }}
           overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
