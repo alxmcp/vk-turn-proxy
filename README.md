@@ -1,66 +1,118 @@
 # Good TURN
+
 Проброс трафика WireGuard/Hysteria через TURN сервера VK звонков или Яндекс телемоста. Пакеты шифруются DTLS 1.2, затем параллельными потоками через TCP или UDP отправляются на TURN сервер по протоколу STUN ChannelData. Оттуда по UDP отправляются на ваш сервер, где расшифровываются и передаются в WireGuard. Логин/пароль от TURN генерируются из ссылки на звонок.
 
 Только для учебных целей!
+
 ## Настройка
+
 Нам понадобится:
+
 1. Ссылка на действующий ВК звонок: создаём свой (нужен аккаунт вк), или гуглим `"https://vk.com/call/join/"`.
-Ссылка действительна вечно, если не нажимать "завершить звонок для всех"
+   Ссылка действительна вечно, если не нажимать "завершить звонок для всех"
 2. Или ссыска на звонок Яндекс телемоста: `"https://telemost.yandex.ru/j/"`. Её лучше не гуглить, так как видно подключение к конференции
 3. VPS с установленным WireGuard
 4. Для андроида: скачать Termux из F-Droid
+
 ### Сервер
+
+Скачать бинарник, в данном примере используется самый популярный сервер `server-linux-amd64`
+
+```bash
+# Скачать бинарник
+curl -L -o server https://github.com/cacggghp/vk-turn-proxy/releases/latest/download/server-linux-amd64 && chmod +x server
 ```
+
+```bash
+# Запуск сервера
 ./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg>
 ```
+
 #### Docker
-Сборка образа:
+
+Образ Docker публикуется в GitHub Container Registry:
+
 ```
+docker pull ghcr.io/cacggghp/vk-turn-proxy:latest
+docker tag ghcr.io/cacggghp/vk-turn-proxy:latest vkt
+```
+
+Для Linux-сервера, где `xray` или WireGuard слушает локально, удобнее запускать через host network:
+
+```
+docker run --rm --network host -e CONNECT_ADDR=127.0.0.1:<порт wg> vkt
+```
+
+Если нужен bridge mode:
+
+```
+docker run --rm -p 56000:56000/udp -e CONNECT_ADDR=<ip хоста>:<порт wg> vkt
+```
+
+Сборка образа вручную:
+
+```
+git clone https://github.com/cacggghp/vk-turn-proxy.git
+cd vk-turn-proxy
 docker build -t vk-turn-proxy .
 ```
 
 Переменная окружения **CONNECT_ADDR** — адрес WireGuard (обязательный), например `192.168.1.10:51820`.
 
 Пример запуска:
+
 ```
 docker run -p 56000:56000/udp -e CONNECT_ADDR=192.168.1.10:51820 vk-turn-proxy
 ```
 
 ### Клиент
+
 #### Android
 
 **Рекомендуемый способ:**
 Использовать нативное Android-приложение [vk-turn-proxy-android](https://github.com/MYSOREZ/vk-turn-proxy-android).
+
 - В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
--  **Добавляем приложение в исключения WireGuard. Нажимаем "сохранить".**
+- **Добавляем приложение в исключения WireGuard. Нажимаем "сохранить".**
 
 **Альтернативный способ (через Termux):**
+
 - В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
--  **Добавляем Termux в исключения WireGuard. Нажимаем "сохранить".**
-В Termux:
+- **Добавляем Termux в исключения WireGuard. Нажимаем "сохранить".**
+  В Termux:
+
 ```
 termux-wake-lock
 ```
+
 Телефон не будет уходить в глубокий сон, так что на ночь ставьте на зарядку. Чтобы отключить:
+
 ```
 termux-wake-unlock
 ```
-Копируем бинарник в локальную папку, даём права на исполнение:
+
+Скачиваем бинарник в локальную папку, даём права на исполнение, в кмоанде указаана самая популярная архитектура:
+
+```bash
+curl -L -o client https://github.com/cacggghp/vk-turn-proxy/releases/latest/download/client-android-arm64 && chmod +x client
 ```
-cp /sdcard/Download/client-android ./
-chmod 777 ./client-android
-```
+
 Запускаем:
+
 ```
-./client-android -peer <ip сервера wg>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000
+./client -listen 127.0.0.1:9000 -peer <ip сервера wg>:56000 -vk-link <VK ссылка>
 ```
+
 Или
+
 ```
-./client-android -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000
+./client -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000
 ```
 
 **Если после включения VPN в терминале вылезают ошибки DNS, попробуйте в Wireguard включить VPN только для нужных приложений.**
+
 #### Linux
+
 В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
 
 Скрипт будет добавлять маршруты к нужным ip:
@@ -74,7 +126,9 @@ chmod 777 ./client-android
 ```
 
 Не включайте впн, пока программа не установит соединение! В отличие от андроида, здесь часть запросов будет идти через впн (dns и запрос подключения к turn)
+
 #### Windows
+
 В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
 
 В PowerShell от Администратора (чтобы скрипт прописывал маршруты):
@@ -88,7 +142,9 @@ chmod 777 ./client-android
 ```
 
 Не включайте впн, пока программа не установит соединение! В отличие от андроида, здесь часть запросов будет идти через впн (dns и запрос подключения к turn)
+
 ### Если не работает
+
 С помощью опции `-turn` можно указать адрес TURN сервера вручную. Это должен быть сервер ВК, Макса или Одноклассников (ссылка вк) или Яндекса (ссылка яндекса). Возможно потом составлю список.
 
 Если не работает TCP, попробуйте добавить флаг `-udp`.
@@ -96,6 +152,7 @@ chmod 777 ./client-android
 Добавьте флаг `-n 1` для более стабильного подключения в 1 поток (ограничение 5 Мбит/с для ВК)
 
 ## Яндекс телемост
+
 **UPD. ТЕЛЕМОСТ ЗАКРЫЛИ**
 
 В отличие от ВК, сервера яндекса не ограничивают скорость, так что по умолчанию стоит `-n 1`. Увеличение этого числа может привести к временной блокировке по IP из-за переполнения конференции фейковыми участниками.
@@ -103,18 +160,17 @@ chmod 777 ./client-android
 В режиме `-udp` скорость обычно больше
 
 Большинство диапазонов IP TURN серверов Яндекса не работают, указывайте вручную через `-turn`
+
 <details>
     <summary>
         Рабочие IP
     </summary>
-
 
     5.255.211.241
     5.255.211.242
     5.255.211.243
     5.255.211.245
     5.255.211.246
-
 
 </details>
 Спасибо https://github.com/KillTheCensorship/Turnel за часть кода :)
@@ -133,51 +189,45 @@ chmod 777 ./client-android
 
 ```json
 {
-    "inbounds": [
-        {
-            "protocol": "socks",
-            "listen": "127.0.0.1",
-            "port": 1080,
-            "settings": {
-                "udp": true
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        },
-        {
-            "protocol": "http",
-            "listen": "127.0.0.1",
-            "port": 8080,
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "wireguard",
-            "settings": {
-                "secretKey": "<client secret key>",
-                "peers": [
-                    {
-                        "endpoint": "127.0.0.1:9000",
-                        "publicKey": "<server public key>"
-                    }
-                ],
-                "domainStrategy": "ForceIPv4",
-                "mtu": 1280
-            }
-        }
-    ]
+  "inbounds": [
+    {
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 1080,
+      "settings": {
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "protocol": "http",
+      "listen": "127.0.0.1",
+      "port": 8080,
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "wireguard",
+      "settings": {
+        "secretKey": "<client secret key>",
+        "peers": [
+          {
+            "endpoint": "127.0.0.1:9000",
+            "publicKey": "<server public key>"
+          }
+        ],
+        "domainStrategy": "ForceIPv4",
+        "mtu": 1280
+      }
+    }
+  ]
 }
 ```
 
@@ -191,41 +241,39 @@ chmod 777 ./client-android
 
 ```json
 {
-    "inbounds": [
-        {
-            "protocol": "wireguard",
-            "listen": "0.0.0.0",
-            "port": 51820,
-            "settings": {
-                "secretKey": "<server secret key>",
-                "peers": [
-                    {
-                        "publicKey": "<client public key>"
-                    }
-                ],
-                "mtu": 1280
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4"
-            }
-        }
-    ]
+  "inbounds": [
+    {
+      "protocol": "wireguard",
+      "listen": "0.0.0.0",
+      "port": 51820,
+      "settings": {
+        "secretKey": "<server secret key>",
+        "peers": [
+          {
+            "publicKey": "<client public key>"
+          }
+        ],
+        "mtu": 1280
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    }
+  ]
 }
 ```
 
 </details>
 
 ## Direct mode
+
 С флагом `-no-dtls` можно отправлять пакеты без обфускации DTLS и подключаться к обычным серверам Wireguard. Может привести к бану от вк/яндекса.
