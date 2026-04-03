@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -15,8 +16,12 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	neturl "net/url"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,11 +36,681 @@ import (
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
+	"github.com/pion/transport/v4"
 	"github.com/pion/turn/v5"
 	"github.com/xtaci/smux"
 )
 
 type getCredsFunc func(string) (string, string, string, error)
+
+const captchaListenPort = "8765"
+
+type browserCommand struct {
+	name string
+	args []string
+}
+
+type directNet struct{}
+
+type directDialer struct {
+	*net.Dialer
+}
+
+type directListenConfig struct {
+	*net.ListenConfig
+}
+
+func newDirectNet() transport.Net {
+	return directNet{}
+}
+
+func (directNet) ListenPacket(network string, address string) (net.PacketConn, error) {
+	return net.ListenPacket(network, address) //nolint:noctx
+}
+
+func (directNet) ListenUDP(network string, locAddr *net.UDPAddr) (transport.UDPConn, error) {
+	return net.ListenUDP(network, locAddr)
+}
+
+func (directNet) ListenTCP(network string, laddr *net.TCPAddr) (transport.TCPListener, error) {
+	listener, err := net.ListenTCP(network, laddr)
+	if err != nil {
+		return nil, err
+	}
+
+	return directTCPListener{listener}, nil
+}
+
+func (directNet) Dial(network, address string) (net.Conn, error) {
+	return net.Dial(network, address) //nolint:noctx
+}
+
+func (directNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
+	return net.DialUDP(network, laddr, raddr)
+}
+
+func (directNet) DialTCP(network string, laddr, raddr *net.TCPAddr) (transport.TCPConn, error) {
+	return net.DialTCP(network, laddr, raddr)
+}
+
+func (directNet) ResolveIPAddr(network, address string) (*net.IPAddr, error) {
+	return net.ResolveIPAddr(network, address)
+}
+
+func (directNet) ResolveUDPAddr(network, address string) (*net.UDPAddr, error) {
+	return net.ResolveUDPAddr(network, address)
+}
+
+func (directNet) ResolveTCPAddr(network, address string) (*net.TCPAddr, error) {
+	return net.ResolveTCPAddr(network, address)
+}
+
+func (directNet) Interfaces() ([]*transport.Interface, error) {
+	return nil, transport.ErrNotSupported
+}
+
+func (directNet) InterfaceByIndex(index int) (*transport.Interface, error) {
+	return nil, fmt.Errorf("%w: index=%d", transport.ErrInterfaceNotFound, index)
+}
+
+func (directNet) InterfaceByName(name string) (*transport.Interface, error) {
+	return nil, fmt.Errorf("%w: %s", transport.ErrInterfaceNotFound, name)
+}
+
+func (directNet) CreateDialer(dialer *net.Dialer) transport.Dialer {
+	return directDialer{Dialer: dialer}
+}
+
+func (directNet) CreateListenConfig(listenerConfig *net.ListenConfig) transport.ListenConfig {
+	return directListenConfig{ListenConfig: listenerConfig}
+}
+
+func (d directDialer) Dial(network, address string) (net.Conn, error) {
+	return d.Dialer.Dial(network, address)
+}
+
+func (d directListenConfig) Listen(ctx context.Context, network, address string) (net.Listener, error) {
+	return d.ListenConfig.Listen(ctx, network, address)
+}
+
+func (d directListenConfig) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	return d.ListenConfig.ListenPacket(ctx, network, address)
+}
+
+type directTCPListener struct {
+	*net.TCPListener
+}
+
+func (l directTCPListener) AcceptTCP() (transport.TCPConn, error) {
+	return l.TCPListener.AcceptTCP()
+}
+
+func localCaptchaOrigin() string {
+	return "http://localhost:" + captchaListenPort
+}
+
+func localCaptchaListenAddrs() []string {
+	return []string{
+		"127.0.0.1:" + captchaListenPort,
+		"[::1]:" + captchaListenPort,
+	}
+}
+
+func localCaptchaHosts() []string {
+	return []string{
+		"localhost:" + captchaListenPort,
+		"127.0.0.1:" + captchaListenPort,
+		"[::1]:" + captchaListenPort,
+	}
+}
+
+func isLocalCaptchaHost(host string) bool {
+	for _, localHost := range localCaptchaHosts() {
+		if strings.EqualFold(host, localHost) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func localCaptchaURLForTarget(targetURL *neturl.URL) string {
+	localURL := &neturl.URL{
+		Scheme:   "http",
+		Host:     "localhost:" + captchaListenPort,
+		Path:     targetURL.Path,
+		RawPath:  targetURL.RawPath,
+		RawQuery: targetURL.RawQuery,
+	}
+	if localURL.Path == "" {
+		localURL.Path = "/"
+	}
+
+	return localURL.String()
+}
+
+func targetOrigin(targetURL *neturl.URL) string {
+	return targetURL.Scheme + "://" + targetURL.Host
+}
+
+func rewriteProxyHeaderURL(raw string, targetURL *neturl.URL) string {
+	if raw == "" {
+		return raw
+	}
+
+	parsed, err := neturl.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if parsed.Scheme != "http" || !isLocalCaptchaHost(parsed.Host) {
+		return raw
+	}
+
+	parsed.Scheme = targetURL.Scheme
+	parsed.Host = targetURL.Host
+
+	return parsed.String()
+}
+
+func rewriteProxyRequest(req *http.Request, targetURL *neturl.URL) {
+	req.URL.Scheme = targetURL.Scheme
+	req.URL.Host = targetURL.Host
+	if req.URL.Path == "" {
+		req.URL.Path = targetURL.Path
+	}
+	req.Host = targetURL.Host
+
+	req.Header.Del("Accept-Encoding")
+	for _, headerName := range []string{"Origin", "Referer"} {
+		if rewritten := rewriteProxyHeaderURL(req.Header.Get(headerName), targetURL); rewritten != "" {
+			req.Header.Set(headerName, rewritten)
+		} else {
+			req.Header.Del(headerName)
+		}
+	}
+}
+
+func extractSuccessToken(body []byte) string {
+	var payload struct {
+		Response struct {
+			SuccessToken string `json:"success_token"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+
+	return payload.Response.SuccessToken
+}
+
+func rewriteProxyCookies(header http.Header) {
+	cookies := (&http.Response{Header: header}).Cookies()
+	if len(cookies) == 0 {
+		return
+	}
+
+	header.Del("Set-Cookie")
+	for _, cookie := range cookies {
+		cookie.Domain = ""
+		cookie.Secure = false
+		cookie.Partitioned = false
+		if cookie.SameSite == http.SameSiteNoneMode || cookie.SameSite == http.SameSiteStrictMode {
+			cookie.SameSite = http.SameSiteLaxMode
+		}
+		header.Add("Set-Cookie", cookie.String())
+	}
+}
+
+func rewriteCaptchaHTML(html string, targetURL *neturl.URL) string {
+	localOrigin := localCaptchaOrigin()
+	upstreamOrigin := targetOrigin(targetURL)
+	html = strings.ReplaceAll(html, upstreamOrigin, localOrigin)
+
+	script := fmt.Sprintf(`
+<script>
+(function() {
+    var localOrigin = %q;
+    var upstreamOrigin = %q;
+
+    function rewriteUrl(urlStr) {
+        if (!urlStr || typeof urlStr !== 'string') return urlStr;
+        if (urlStr.indexOf(localOrigin) === 0) return urlStr;
+        if (urlStr.indexOf(upstreamOrigin) === 0) return localOrigin + urlStr.slice(upstreamOrigin.length);
+        if (urlStr.indexOf('//') === 0) {
+            return '/generic_proxy?proxy_url=' + encodeURIComponent(window.location.protocol + urlStr);
+        }
+        if (urlStr.indexOf('http://') === 0 || urlStr.indexOf('https://') === 0) {
+            return '/generic_proxy?proxy_url=' + encodeURIComponent(urlStr);
+        }
+        return urlStr;
+    }
+
+    function rewriteElementAttr(el, attr) {
+        if (!el || !el.getAttribute) return;
+        var value = el.getAttribute(attr);
+        if (!value) return;
+        var rewritten = rewriteUrl(value);
+        if (rewritten !== value) {
+            el.setAttribute(attr, rewritten);
+        }
+    }
+
+    function rewriteDocument(root) {
+        if (!root || !root.querySelectorAll) return;
+        root.querySelectorAll('[href]').forEach(function(el) { rewriteElementAttr(el, 'href'); });
+        root.querySelectorAll('[src]').forEach(function(el) { rewriteElementAttr(el, 'src'); });
+        root.querySelectorAll('form[action]').forEach(function(el) { rewriteElementAttr(el, 'action'); });
+    }
+
+    function handleSuccessToken(token) {
+        if (!token) return;
+        fetch('/local-captcha-result', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'token=' + encodeURIComponent(token)
+        }).then(function() {
+            document.body.innerHTML = '<h2 style="text-align:center;margin-top:20vh">Готово! Можете закрыть страницу.</h2>';
+            setTimeout(function() { window.close(); }, 300);
+        }).catch(function() {});
+    }
+
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function() {
+        if (arguments[1] && typeof arguments[1] === 'string') {
+            this._origUrl = arguments[1];
+            arguments[1] = rewriteUrl(arguments[1]);
+        }
+        return origOpen.apply(this, arguments);
+    };
+
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function() {
+        var xhr = this;
+        if (this._origUrl && this._origUrl.indexOf('captchaNotRobot.check') !== -1) {
+            xhr.addEventListener('load', function() {
+                try {
+                    var data = JSON.parse(xhr.responseText);
+                    if (data.response && data.response.success_token) {
+                        handleSuccessToken(data.response.success_token);
+                    }
+                } catch (e) {}
+            });
+        }
+        return origSend.apply(this, arguments);
+    };
+
+    var origFetch = window.fetch;
+    if (origFetch) {
+        window.fetch = function() {
+            var url = arguments[0];
+            var isObj = (typeof url === 'object' && url && url.url);
+            var urlStr = isObj ? url.url : url;
+            var origUrlStr = urlStr;
+
+            if (typeof urlStr === 'string') {
+                urlStr = rewriteUrl(urlStr);
+                arguments[0] = urlStr;
+            }
+
+            var p = origFetch.apply(this, arguments);
+            if (typeof origUrlStr === 'string' && origUrlStr.indexOf('captchaNotRobot.check') !== -1) {
+                p.then(function(response) {
+                    return response.clone().json();
+                }).then(function(data) {
+                    if (data.response && data.response.success_token) {
+                        handleSuccessToken(data.response.success_token);
+                    }
+                }).catch(function() {});
+            }
+            return p;
+        };
+    }
+
+    document.addEventListener('submit', function(event) {
+        if (event.target && event.target.action) {
+            event.target.action = rewriteUrl(event.target.action);
+        }
+    }, true);
+
+    document.addEventListener('click', function(event) {
+        var target = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+        if (target && target.href) {
+            target.href = rewriteUrl(target.href);
+        }
+    }, true);
+
+    var origFormSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function() {
+        if (this.action) {
+            this.action = rewriteUrl(this.action);
+        }
+        return origFormSubmit.apply(this, arguments);
+    };
+
+    var origWindowOpen = window.open;
+    if (origWindowOpen) {
+        window.open = function(url) {
+            if (typeof url === 'string') {
+                arguments[0] = rewriteUrl(url);
+            }
+            return origWindowOpen.apply(this, arguments);
+        };
+    }
+
+    rewriteDocument(document);
+    if (document.documentElement && window.MutationObserver) {
+        new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+                if (mutation.type === 'attributes' && mutation.target) {
+                    rewriteElementAttr(mutation.target, mutation.attributeName);
+                    return;
+                }
+                mutation.addedNodes.forEach(function(node) {
+                    if (node.nodeType === 1) {
+                        rewriteDocument(node);
+                    }
+                });
+            });
+        }).observe(document.documentElement, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: ['href', 'src', 'action']
+        });
+    }
+})();
+</script>
+`, localOrigin, upstreamOrigin)
+
+	switch {
+	case strings.Contains(html, "</head>"):
+		return strings.Replace(html, "</head>", script+"</head>", 1)
+	case strings.Contains(html, "</body>"):
+		return strings.Replace(html, "</body>", script+"</body>", 1)
+	default:
+		return html + script
+	}
+}
+
+func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	if dialer != nil {
+		transport.DialContext = dialer.DialContext
+	}
+
+	return transport
+}
+
+func startCaptchaServer(srv *http.Server, logPrefix string) error {
+	var listenErrs []string
+	var listening bool
+
+	for _, addr := range localCaptchaListenAddrs() {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			listenErrs = append(listenErrs, fmt.Sprintf("%s (%v)", addr, err))
+			continue
+		}
+		listening = true
+		go func(listener net.Listener) {
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				log.Printf("%s: %s", logPrefix, err)
+			}
+		}(listener)
+	}
+
+	if listening {
+		return nil
+	}
+
+	return fmt.Errorf("captcha listeners failed: %s", strings.Join(listenErrs, "; "))
+}
+
+func solveCaptchaViaHTTP(captchaImg string) (string, error) {
+	keyCh := make(chan string, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:sans-serif;text-align:center;padding:20px}
+img{max-width:100%%;margin:16px 0}
+input{font-size:24px;padding:12px;width:80%%;box-sizing:border-box}
+button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
+</head><body>
+<h2>Введите капчу</h2>
+<img src="%s" alt="captcha"/>
+<form onsubmit="fetch('/solve?key='+encodeURIComponent(document.getElementById('k').value)).then(()=>{document.body.innerHTML='<h2>Готово</h2>';setTimeout(function(){window.close();}, 300);});return false;">
+<br><input id="k" type="text" autofocus placeholder="Текст с картинки"/>
+<br><button type="submit">Отправить</button>
+</form></body></html>`, captchaImg)
+	})
+	mux.HandleFunc("/solve", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if key != "" {
+			select {
+			case keyCh <- key:
+			default:
+			}
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!DOCTYPE html><html><body><h2>Готово</h2></body></html>`)
+	})
+
+	srv := &http.Server{
+		Addr:    "localhost:" + captchaListenPort,
+		Handler: mux,
+	}
+
+	if err := startCaptchaServer(srv, "captcha HTTP server error"); err != nil {
+		return "", err
+	}
+
+	captchaURL := localCaptchaOrigin()
+	fmt.Println("CAPTCHA_REQUIRED: " + captchaURL)
+	openBrowser(captchaURL)
+
+	key := <-keyCh
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+
+	return key, nil
+}
+
+func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
+	keyCh := make(chan string, 1)
+
+	targetURL, err := neturl.Parse(redirectURI)
+	if err != nil {
+		return "", fmt.Errorf("invalid redirect URI: %v", err)
+	}
+	transport := newCaptchaProxyTransport(dialer)
+
+	proxy := &httputil.ReverseProxy{
+		Transport: transport,
+		Director: func(req *http.Request) {
+			rewriteProxyRequest(req, targetURL)
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("captcha proxy error for %s: %v", r.URL.String(), err)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprintf(w, `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:20px"><h2>Captcha proxy error</h2><p>%s</p><p>Try opening the link again after excluding your browser from the VPN on Android.</p></body></html>`, err)
+		},
+		ModifyResponse: func(res *http.Response) error {
+			rewriteProxyCookies(res.Header)
+
+			if res.StatusCode >= 300 && res.StatusCode < 400 && res.Header.Get("Location") != "" {
+				loc := res.Header.Get("Location")
+				if strings.HasPrefix(loc, "/") {
+					res.Header.Set("Location", loc)
+				} else if strings.HasPrefix(loc, targetOrigin(targetURL)) {
+					res.Header.Set("Location", strings.Replace(loc, targetOrigin(targetURL), localCaptchaOrigin(), 1))
+				}
+			}
+
+			contentType := res.Header.Get("Content-Type")
+			shouldInspectBody := strings.Contains(contentType, "text/html") || strings.Contains(res.Request.URL.Path, "captchaNotRobot.check")
+			if !shouldInspectBody {
+				return nil
+			}
+
+			reader := res.Body
+			if res.Header.Get("Content-Encoding") == "gzip" {
+				gzReader, err := gzip.NewReader(res.Body)
+				if err == nil {
+					reader = gzReader
+					defer gzReader.Close()
+				}
+			}
+
+			bodyBytes, err := io.ReadAll(reader)
+			if err != nil {
+				return err
+			}
+			res.Body.Close()
+
+			if strings.Contains(res.Request.URL.Path, "captchaNotRobot.check") {
+				if token := extractSuccessToken(bodyBytes); token != "" {
+					select {
+					case keyCh <- token:
+					default:
+					}
+				}
+			}
+
+			if strings.Contains(contentType, "text/html") {
+				for _, headerName := range []string{
+					"Content-Security-Policy",
+					"Content-Security-Policy-Report-Only",
+					"X-Content-Security-Policy",
+					"X-WebKit-CSP",
+					"Cross-Origin-Opener-Policy",
+					"Cross-Origin-Embedder-Policy",
+					"Cross-Origin-Resource-Policy",
+					"X-Frame-Options",
+				} {
+					res.Header.Del(headerName)
+				}
+
+				bodyBytes = []byte(rewriteCaptchaHTML(string(bodyBytes), targetURL))
+				res.Header.Del("Content-Encoding")
+			}
+
+			res.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			res.ContentLength = int64(len(bodyBytes))
+			res.Header.Set("Content-Length", fmt.Sprint(len(bodyBytes)))
+
+			return nil
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/local-captcha-result", func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		token := r.FormValue("token")
+		if token != "" {
+			select {
+			case keyCh <- token:
+			default:
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		fmt.Fprint(w, "ok")
+	})
+	mux.HandleFunc("/generic_proxy", func(w http.ResponseWriter, r *http.Request) {
+		targetAuthUrl := r.URL.Query().Get("proxy_url")
+		targetParsed, err := neturl.Parse(targetAuthUrl)
+		if err != nil || targetParsed.Host == "" {
+			http.Error(w, "Bad URL", 400)
+			return
+		}
+		genericReverse := &httputil.ReverseProxy{
+			Transport: transport,
+			Director: func(req *http.Request) {
+				req.URL.Path = targetParsed.Path
+				req.URL.RawQuery = targetParsed.RawQuery
+				rewriteProxyRequest(req, targetParsed)
+			},
+		}
+		genericReverse.ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && targetURL.Path != "" && targetURL.Path != "/" && r.URL.RawQuery == "" {
+			http.Redirect(w, r, localCaptchaURLForTarget(targetURL), http.StatusTemporaryRedirect)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
+	srv := &http.Server{
+		Addr:    "localhost:" + captchaListenPort,
+		Handler: mux,
+	}
+
+	if err := startCaptchaServer(srv, "proxy HTTP server error"); err != nil {
+		return "", err
+	}
+
+	captchaURL := localCaptchaURLForTarget(targetURL)
+	fmt.Println("CAPTCHA_REQUIRED: " + captchaURL)
+	openBrowser(captchaURL)
+
+	key := <-keyCh
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+
+	return key, nil
+}
+
+func openBrowser(url string) {
+	for _, cmd := range browserOpenCommands(runtime.GOOS, url) {
+		if err := exec.Command(cmd.name, cmd.args...).Start(); err == nil {
+			return
+		}
+	}
+}
+
+func browserOpenCommands(goos string, url string) []browserCommand {
+	switch goos {
+	case "windows":
+		return []browserCommand{{name: "cmd", args: []string{"/c", "start", url}}}
+	case "darwin":
+		return []browserCommand{{name: "open", args: []string{url}}}
+	case "linux":
+		return []browserCommand{
+			{name: "xdg-open", args: []string{url}},
+			{name: "gio", args: []string{"open", url}},
+		}
+	case "android":
+		return []browserCommand{
+			{name: "termux-open-url", args: []string{url}},
+			{name: "/system/bin/am", args: []string{"start", "-a", "android.intent.action.VIEW", "-d", url}},
+			{name: "am", args: []string{"start", "-a", "android.intent.action.VIEW", "-d", url}},
+			{name: "xdg-open", args: []string{url}},
+		}
+	case "ios":
+		return []browserCommand{
+			{name: "open", args: []string{url}},
+			{name: "uiopen", args: []string{url}},
+		}
+	}
+
+	return nil
+}
 
 func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, error) {
 	profile := getRandomProfile()
@@ -99,17 +774,86 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 		return "", "", "", fmt.Errorf("request error:%s", err)
 	}
 
-	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
+	dataMap, ok := resp["data"].(map[string]interface{})
+	if !ok {
+		return "", "", "", fmt.Errorf("unexpected anon token response: %v", resp)
+	}
+	token1, ok := dataMap["access_token"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing access_token in response: %v", resp)
+	}
 
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, generateName(), token1)
 	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
 
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
+	var token2 string
+	const maxCaptchaAttempts = 3
+	for attempt := 0; attempt <= maxCaptchaAttempts; attempt++ {
+		resp, err = doRequest(data, url)
+		if err != nil {
+			return "", "", "", fmt.Errorf("request error:%s", err)
+		}
 
-	token2 := resp["response"].(map[string]interface{})["token"].(string)
+		// Check for captcha error
+		if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
+			errCode, _ := errObj["error_code"].(float64)
+			if errCode == 14 {
+				if attempt == maxCaptchaAttempts {
+					return "", "", "", fmt.Errorf("captcha failed after %d attempts", maxCaptchaAttempts)
+				}
+
+				captchaSid, _ := errObj["captcha_sid"].(string)
+				if captchaSid == "" {
+					// captcha_sid may be a number
+					if sidNum, ok := errObj["captcha_sid"].(float64); ok {
+						captchaSid = fmt.Sprintf("%.0f", sidNum)
+					}
+				}
+				captchaImg, _ := errObj["captcha_img"].(string)
+				redirectURI, _ := errObj["redirect_uri"].(string)
+
+				log.Printf("Captcha required (attempt %d/%d), sid=%s", attempt+1, maxCaptchaAttempts, captchaSid)
+
+				var solveErr error
+				var successToken string
+				var captchaKey string
+
+				if redirectURI != "" {
+					successToken, solveErr = solveCaptchaViaProxy(redirectURI, dialer)
+					if solveErr != nil {
+						return "", "", "", fmt.Errorf("proxy captcha solve error: %s", solveErr)
+					}
+					captchaTs, _ := errObj["captcha_ts"].(float64)
+					captchaAttempt, _ := errObj["captcha_attempt"].(float64)
+					if captchaAttempt == 0 {
+						captchaAttempt = 1
+					}
+
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
+						link, token1, captchaSid, neturl.QueryEscape(successToken), captchaTs, int(captchaAttempt))
+				} else {
+					captchaKey, solveErr = solveCaptchaViaHTTP(captchaImg)
+					if solveErr != nil {
+						return "", "", "", fmt.Errorf("captcha solve error: %s", solveErr)
+					}
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s&captcha_sid=%s&captcha_key=%s",
+						link, token1, captchaSid, captchaKey)
+				}
+				continue
+			}
+			return "", "", "", fmt.Errorf("VK API error: %v", errObj)
+		}
+
+		respMap, ok := resp["response"].(map[string]interface{})
+		if !ok {
+			return "", "", "", fmt.Errorf("unexpected getAnonymousToken response: %v", resp)
+		}
+		token2, ok = respMap["token"].(string)
+		if !ok {
+			return "", "", "", fmt.Errorf("missing token in response: %v", resp)
+		}
+		break
+	}
 
 	data = fmt.Sprintf("%s%s%s", "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22", uuid.New(), "%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA")
 	url = "https://calls.okcdn.ru/fb.do"
@@ -665,6 +1409,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		STUNServerAddr:         turnServerAddr,
 		TURNServerAddr:         turnServerAddr,
 		Conn:                   turnConn,
+		Net:                    newDirectNet(),
 		Username:               user,
 		Password:               pass,
 		RequestedAddressFamily: addrFamily,
@@ -815,6 +1560,25 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 	}
 }
 
+func cachedCreds(f getCredsFunc) getCredsFunc {
+	var mu sync.Mutex
+	var cUser, cPass, cAddr string
+	var cTime time.Time
+	return func(link string) (string, string, string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !cTime.IsZero() && time.Since(cTime) < 10*time.Minute {
+			return cUser, cPass, cAddr, nil
+		}
+		u, p, a, err := f(link)
+		if err == nil {
+			cUser, cPass, cAddr = u, p, a
+			cTime = time.Now()
+		}
+		return u, p, a, err
+	}
+}
+
 func main() { //nolint:cyclop
 	rand.Seed(time.Now().UnixNano())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -838,7 +1602,7 @@ func main() { //nolint:cyclop
 	vklink := flag.String("vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
 	yalink := flag.String("yandex-link", "", "Yandex telemost invite link \"https://telemost.yandex.ru/j/...\"")
 	peerAddr := flag.String("peer", "", "peer server address (host:port)")
-	n := flag.Int("n", 0, "connections to TURN (default 16 for VK, 1 for Yandex)")
+	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
 	tcpMode := flag.Bool("tcp", false, "TCP mode: forward TCP connections (for VLESS) instead of UDP packets")
@@ -870,7 +1634,7 @@ func main() { //nolint:cyclop
 			return getVkCreds(s, dialer)
 		}
 		if *n <= 0 {
-			*n = 16
+			*n = 10
 		}
 	} else {
 		parts := strings.Split(*yalink, "j/")
@@ -888,7 +1652,7 @@ func main() { //nolint:cyclop
 		*port,
 		link,
 		*udp,
-		getCreds,
+		cachedCreds(getCreds),
 	}
 
 	if *tcpMode {
@@ -1181,6 +1945,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr) (
 		STUNServerAddr:         turnServerAddr,
 		TURNServerAddr:         turnServerAddr,
 		Conn:                   turnConn,
+		Net:                    newDirectNet(),
 		Username:               user,
 		Password:               pass,
 		RequestedAddressFamily: addrFamily,
