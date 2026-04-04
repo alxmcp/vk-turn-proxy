@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/bschaatsbergen/dnsdialer"
-	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -39,10 +38,9 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/transport/v4"
 	"github.com/pion/turn/v5"
-	"github.com/xtaci/smux"
 )
 
-type getCredsFunc func(string) (string, string, string, error)
+type getCredsFunc func(ctx context.Context, link string, streamID int) (string, string, string, error)
 
 type directNet struct{}
 
@@ -142,23 +140,39 @@ func (l directTCPListener) AcceptTCP() (transport.TCPConn, error) {
 	return l.TCPListener.AcceptTCP()
 }
 
-// --- AUTOMATIC CAPTCHA SOLVER ---
+// region Helper: HTTP Headers Injection
 
-type vkCaptchaError struct {
-	ErrorCode      int
-	ErrorMsg       string
-	CaptchaSid     string
-	RedirectUri    string
-	SessionToken   string
-	CaptchaTs      string
-	CaptchaAttempt string
+// applyBrowserProfile applies consistent User-Agent and Client Hints to bypass WAFs
+func applyBrowserProfile(req *http.Request, profile Profile) {
+	req.Header.Set("User-Agent", profile.UserAgent)
+	req.Header.Set("sec-ch-ua", profile.SecChUa)
+	req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
+	req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("DNT", "1")
 }
 
-func parseVkCaptchaError(errData map[string]interface{}) *vkCaptchaError {
-	codeFloat, _ := errData["error_code"].(float64)
-	redirectUri, _ := errData["redirect_uri"].(string)
-	errorMsg, _ := errData["error_msg"].(string)
+// endregion
 
+// region Automatic Captcha Solver & Authentication
+
+type VkCaptchaError struct {
+	ErrorCode               int
+	ErrorMsg                string
+	CaptchaSid              string
+	CaptchaImg              string
+	RedirectUri             string
+	IsSoundCaptchaAvailable bool
+	SessionToken            string
+	CaptchaTs               string
+	CaptchaAttempt          string
+}
+
+func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
+	codeFloat, _ := errData["error_code"].(float64)
+	code := int(codeFloat)
+
+	redirectUri, _ := errData["redirect_uri"].(string)
 	captchaSid, _ := errData["captcha_sid"].(string)
 	if captchaSid == "" {
 		if sidNum, ok := errData["captcha_sid"].(float64); ok {
@@ -166,12 +180,17 @@ func parseVkCaptchaError(errData map[string]interface{}) *vkCaptchaError {
 		}
 	}
 
+	captchaImg, _ := errData["captcha_img"].(string)
+	errorMsg, _ := errData["error_msg"].(string)
+
 	var sessionToken string
 	if redirectUri != "" {
 		if parsed, err := neturl.Parse(redirectUri); err == nil {
 			sessionToken = parsed.Query().Get("session_token")
 		}
 	}
+
+	isSound, _ := errData["is_sound_captcha_available"].(bool)
 
 	var captchaTs string
 	if tsFloat, ok := errData["captcha_ts"].(float64); ok {
@@ -187,69 +206,111 @@ func parseVkCaptchaError(errData map[string]interface{}) *vkCaptchaError {
 		captchaAttempt = attStr
 	}
 
-	return &vkCaptchaError{
-		ErrorCode:      int(codeFloat),
-		ErrorMsg:       errorMsg,
-		CaptchaSid:     captchaSid,
-		RedirectUri:    redirectUri,
-		SessionToken:   sessionToken,
-		CaptchaTs:      captchaTs,
-		CaptchaAttempt: captchaAttempt,
+	return &VkCaptchaError{
+		ErrorCode:               code,
+		ErrorMsg:                errorMsg,
+		CaptchaSid:              captchaSid,
+		CaptchaImg:              captchaImg,
+		RedirectUri:             redirectUri,
+		IsSoundCaptchaAvailable: isSound,
+		SessionToken:            sessionToken,
+		CaptchaTs:               captchaTs,
+		CaptchaAttempt:          captchaAttempt,
 	}
 }
 
-func solveVkCaptcha(ctx context.Context, captchaErr *vkCaptchaError, dialer *dnsdialer.Dialer) (string, error) {
-	log.Printf("Solving VK Smart Captcha automatically...")
+func (e *VkCaptchaError) IsCaptchaError() bool {
+	return e.ErrorCode == 14
+}
+
+func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, error) {
+	log.Printf("[STREAM %d] [Captcha] Solving Not Robot Captcha...", streamID)
+
 	if captchaErr.SessionToken == "" {
-		return "", fmt.Errorf("no session_token in redirect_uri")
+		return "", fmt.Errorf("no session_token in redirect_uri for auto-solve")
+	}
+	if captchaErr.RedirectUri == "" {
+		return "", fmt.Errorf("no redirect_uri for auto-solve")
 	}
 
-	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, dialer)
+	// HAR Timing: Browser page load & user perception
+	time.Sleep(1500*time.Millisecond + time.Duration(rand.Intn(1000))*time.Millisecond)
+
+	powInput, difficulty, cookies, err := fetchPowInput(ctx, captchaErr.RedirectUri, streamID, dialer, profile)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PoW input: %w", err)
 	}
 
-	hash := solvePoW(powInput, difficulty)
+	log.Printf("[STREAM %d] [Captcha] PoW input: %s, difficulty: %d", streamID, powInput, difficulty)
 
-	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, dialer)
+	hash := solvePoW(powInput, difficulty)
+	log.Printf("[STREAM %d] [Captcha] PoW solved: hash=%s", streamID, hash)
+
+	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, cookies, streamID, dialer, profile)
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 	}
 
-	log.Printf("VK Smart Captcha Solved Successfully!")
+	log.Printf("[STREAM %d] [Captcha] Success! Got success_token", streamID)
 	return successToken, nil
 }
 
-func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Dialer) (string, int, error) {
+func fetchPowInput(ctx context.Context, redirectUri string, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, int, string, error) {
+	parsedURL, err := neturl.Parse(redirectUri)
+	if err != nil {
+		return "", 0, "", err
+	}
+	domain := parsedURL.Hostname()
+
 	req, err := http.NewRequestWithContext(ctx, "GET", redirectUri, nil)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+	req.Host = domain // Explicitly force Host header
+	applyBrowserProfile(req, profile)
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	client := &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
 			DialContext: dialer.DialContext,
+			TLSClientConfig: &tls.Config{
+				ServerName: domain, // Force SNI for DPI evasion
+			},
 		},
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
+
+	var cookies []string
+	for _, setCookie := range resp.Header.Values("Set-Cookie") {
+		cookieParts := strings.Split(setCookie, ";")
+		cookies = append(cookies, strings.TrimSpace(cookieParts[0]))
+	}
+	cookieHeader := strings.Join(cookies, "; ")
+	if cookieHeader != "" {
+		log.Printf("[STREAM %d] [Captcha] Captcha page set %d cookie(s)", streamID, len(cookies))
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	html := string(body)
 
 	powInputRe := regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
 	powInputMatch := powInputRe.FindStringSubmatch(html)
 	if len(powInputMatch) < 2 {
-		return "", 0, fmt.Errorf("powInput not found in captcha HTML")
+		return "", 0, "", fmt.Errorf("powInput not found in captcha HTML")
 	}
 	powInput := powInputMatch[1]
 
@@ -261,7 +322,7 @@ func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Di
 			difficulty = d
 		}
 	}
-	return powInput, difficulty, nil
+	return powInput, difficulty, cookieHeader, nil
 }
 
 func solvePoW(powInput string, difficulty int) string {
@@ -277,22 +338,39 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, dialer *dnsdialer.Dialer) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, cookies string, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
+		parsedURL, _ := neturl.Parse(reqURL)
+		domain := parsedURL.Hostname()
+
 		req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+		req.Host = domain
+		applyBrowserProfile(req, profile)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Origin", "https://vk.ru")
-		req.Header.Set("Referer", "https://vk.ru/")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Origin", "https://id.vk.ru")
+		req.Header.Set("Referer", "https://id.vk.ru/")
+		req.Header.Set("Sec-Fetch-Site", "same-site")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Priority", "u=1, i")
+
+		if cookies != "" {
+			req.Header.Set("Cookie", cookies)
+		}
 
 		client := &http.Client{
 			Timeout: 20 * time.Second,
 			Transport: &http.Transport{
 				DialContext: dialer.DialContext,
+				TLSClientConfig: &tls.Config{
+					ServerName: domain, // Enforce SNI for DPI evasion
+				},
 			},
 		}
 
@@ -300,7 +378,9 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, dialer 
 		if err != nil {
 			return nil, err
 		}
-		defer httpResp.Body.Close()
+		defer func(Body io.ReadCloser) {
+			_ = Body.Close()
+		}(httpResp.Body)
 
 		body, err := io.ReadAll(httpResp.Body)
 		if err != nil {
@@ -315,32 +395,40 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, dialer 
 
 	baseParams := fmt.Sprintf("session_token=%s&domain=vk.com&adFp=&access_token=", neturl.QueryEscape(sessionToken))
 
-	// Step 1: settings
+	log.Printf("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	if _, err := vkReq("captchaNotRobot.settings", baseParams); err != nil {
 		return "", fmt.Errorf("settings failed: %w", err)
 	}
-	time.Sleep(200 * time.Millisecond)
 
-	// Step 2: componentDone
-	browserFp := fmt.Sprintf("%032x", rand.Int63())
+	// HAR Timing: settings -> componentDone
+	time.Sleep(100*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond)
+
+	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
+	browserFp := fmt.Sprintf("%016x%016x", rand.Int63(), rand.Int63())
 	deviceJSON := `{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1032,"innerWidth":1920,"innerHeight":945,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":16,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"denied"}`
 	componentDoneData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, neturl.QueryEscape(deviceJSON))
 
 	if _, err := vkReq("captchaNotRobot.componentDone", componentDoneData); err != nil {
 		return "", fmt.Errorf("componentDone failed: %w", err)
 	}
-	time.Sleep(200 * time.Millisecond)
 
-	// Step 3: check
+	// HAR Timing: componentDone -> check ≈ 1.95s + statEvents delay ≈ 3.2s total
+	time.Sleep(1950*time.Millisecond + time.Duration(rand.Intn(1250))*time.Millisecond)
+
+	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
 	cursorJSON := `[{"x":950,"y":500},{"x":945,"y":510},{"x":940,"y":520},{"x":938,"y":525},{"x":938,"y":525}]`
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 	debugInfo := "d44f534ce8deb56ba20be52e05c433309b49ee4d2a70602deeb17a1954257785"
+
+	baseDownlink := 8.0 + rand.Float64()*4.0
+	downlinkStr := fmt.Sprintf("%.1f", baseDownlink)
+	connectionDownlink := "[" + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "]"
 
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
 		neturl.QueryEscape("[]"), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
 		neturl.QueryEscape(cursorJSON), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
-		neturl.QueryEscape("[9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5]"),
+		neturl.QueryEscape(connectionDownlink),
 		browserFp, hash, answer, debugInfo,
 	)
 
@@ -362,24 +450,232 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, dialer 
 		return "", fmt.Errorf("success_token not found")
 	}
 
-	time.Sleep(200 * time.Millisecond)
-
-	// Step 4: endSession
-	vkReq("captchaNotRobot.endSession", baseParams)
+	log.Printf("[STREAM %d] [Captcha] Step 4/4: endSession", streamID)
+	_, err = vkReq("captchaNotRobot.endSession", baseParams)
+	if err != nil {
+		log.Printf("[STREAM %d] [Captcha] Warning: endSession failed: %v", streamID, err)
+	}
 
 	return successToken, nil
 }
 
-// --- END CAPTCHA SOLVER ---
+// endregion
 
-func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, error) {
+// region VK Credentials & Caching Layer
+
+type VKCredentials struct {
+	ClientID     string
+	ClientSecret string
+}
+
+var vkCredentialsList = []VKCredentials{
+	{ClientID: "6287487", ClientSecret: "QbYic1K3lEV5kTGiqlq2"},  // VK_WEB_APP_ID
+	{ClientID: "7879029", ClientSecret: "aR5NKGmm03GYrCiNKsaw"},  // VK_MVK_APP_ID
+	{ClientID: "52461373", ClientSecret: "o557NLIkAErNhakXrQ7A"}, // VK_WEB_VKVIDEO_APP_ID
+	{ClientID: "52649896", ClientSecret: "WStp4ihWG4l3nmXZgIbC"}, // VK_MVK_VKVIDEO_APP_ID
+	{ClientID: "51781872", ClientSecret: "IjjCNl4L4Tf5QZEXIHKK"}, // VK_ID_AUTH_APP
+}
+
+type TurnCredentials struct {
+	Username   string
+	Password   string
+	ServerAddr string
+	ExpiresAt  time.Time
+	Link       string
+}
+
+type StreamCredentialsCache struct {
+	creds         TurnCredentials
+	mutex         sync.RWMutex
+	errorCount    atomic.Int32
+	lastErrorTime atomic.Int64
+}
+
+const (
+	credentialLifetime = 10 * time.Minute
+	cacheSafetyMargin  = 60 * time.Second
+	maxCacheErrors     = 3
+	errorWindow        = 10 * time.Second
+	streamsPerCache    = 10
+)
+
+func getCacheID(streamID int) int {
+	return streamID / streamsPerCache
+}
+
+var vkRequestMu sync.Mutex
+
+func vkDelayRandom(minMs, maxMs int) {
+	ms := minMs + rand.Intn(maxMs-minMs+1)
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+}
+
+var credentialsStore = struct {
+	mu     sync.RWMutex
+	caches map[int]*StreamCredentialsCache
+}{
+	caches: make(map[int]*StreamCredentialsCache),
+}
+
+func getStreamCache(streamID int) *StreamCredentialsCache {
+	cacheID := getCacheID(streamID)
+
+	credentialsStore.mu.RLock()
+	cache, exists := credentialsStore.caches[cacheID]
+	credentialsStore.mu.RUnlock()
+
+	if exists {
+		return cache
+	}
+
+	credentialsStore.mu.Lock()
+	defer credentialsStore.mu.Unlock()
+
+	if cache, exists = credentialsStore.caches[cacheID]; exists {
+		return cache
+	}
+
+	cache = &StreamCredentialsCache{}
+	credentialsStore.caches[cacheID] = cache
+	return cache
+}
+
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "401") ||
+		strings.Contains(errStr, "Unauthorized") ||
+		strings.Contains(errStr, "authentication") ||
+		strings.Contains(errStr, "invalid credential") ||
+		strings.Contains(errStr, "stale nonce")
+}
+
+func handleAuthError(streamID int) bool {
+	cache := getStreamCache(streamID)
+	cacheID := getCacheID(streamID)
+
+	now := time.Now().Unix()
+
+	if now-cache.lastErrorTime.Load() > int64(errorWindow.Seconds()) {
+		cache.errorCount.Store(0)
+	}
+
+	count := cache.errorCount.Add(1)
+	cache.lastErrorTime.Store(now)
+
+	log.Printf("[STREAM %d] Auth error (cache=%d, count=%d/%d)", streamID, cacheID, count, maxCacheErrors)
+
+	if count >= maxCacheErrors {
+		log.Printf("[VK Auth] Multiple auth errors detected (%d), invalidating cache %d for stream %d...", count, cacheID, streamID)
+		cache.invalidate(streamID)
+		return true
+	}
+	return false
+}
+
+func (c *StreamCredentialsCache) invalidate(streamID int) {
+	c.mutex.Lock()
+	c.creds = TurnCredentials{}
+	c.mutex.Unlock()
+
+	c.errorCount.Store(0)
+	c.lastErrorTime.Store(0)
+
+	log.Printf("[STREAM %d] [VK Auth] Credentials cache invalidated", streamID)
+}
+
+func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+	cache := getStreamCache(streamID)
+	cacheID := getCacheID(streamID)
+
+	cache.mutex.RLock()
+	if cache.creds.Link == link && time.Now().Before(cache.creds.ExpiresAt) {
+		expires := time.Until(cache.creds.ExpiresAt)
+		u, p, a := cache.creds.Username, cache.creds.Password, cache.creds.ServerAddr
+		cache.mutex.RUnlock()
+		log.Printf("[STREAM %d] [VK Auth] Using cached credentials (cache=%d, expires in %v)", streamID, cacheID, expires)
+		return u, p, a, nil
+	}
+	cache.mutex.RUnlock()
+
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	// Double-check
+	if cache.creds.Link == link && time.Now().Before(cache.creds.ExpiresAt) {
+		expires := time.Until(cache.creds.ExpiresAt)
+		log.Printf("[STREAM %d] [VK Auth] Using cached credentials (cache=%d, expires in %v)", streamID, cacheID, expires)
+		return cache.creds.Username, cache.creds.Password, cache.creds.ServerAddr, nil
+	}
+
+	log.Printf("[STREAM %d] [VK Auth] Cache miss (cache=%d), starting credential fetch...", streamID, cacheID)
+
+	select {
+	case <-ctx.Done():
+		return "", "", "", ctx.Err()
+	default:
+	}
+
+	user, pass, addr, err := fetchVkCredsSerialized(ctx, link, streamID, dialer)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	cache.creds = TurnCredentials{
+		Username:   user,
+		Password:   pass,
+		ServerAddr: addr,
+		ExpiresAt:  time.Now().Add(credentialLifetime - cacheSafetyMargin),
+		Link:       link,
+	}
+
+	log.Printf("[STREAM %d] [VK Auth] Success! Credentials cached until %v (cache=%d)", streamID, cache.creds.ExpiresAt, cacheID)
+	return user, pass, addr, nil
+}
+
+func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+	vkRequestMu.Lock()
+	defer vkRequestMu.Unlock()
+	return fetchVkCreds(ctx, link, streamID, dialer)
+}
+
+func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+	var lastErr error
+
+	for _, creds := range vkCredentialsList {
+		log.Printf("[STREAM %d] [VK Auth] Trying credentials: client_id=%s", streamID, creds.ClientID)
+
+		user, pass, addr, err := getTokenChain(ctx, link, streamID, creds, dialer)
+
+		if err == nil {
+			log.Printf("[STREAM %d] [VK Auth] Success with client_id=%s", streamID, creds.ClientID)
+			return user, pass, addr, nil
+		}
+
+		lastErr = err
+		log.Printf("[STREAM %d] [VK Auth] Failed with client_id=%s: %v", streamID, creds.ClientID, err)
+
+		if strings.Contains(err.Error(), "error_code:29") || strings.Contains(err.Error(), "error_code: 29") || strings.Contains(err.Error(), "Rate limit") {
+			log.Printf("[STREAM %d] [VK Auth] Rate limit detected, trying next credentials...", streamID)
+		}
+	}
+
+	return "", "", "", fmt.Errorf("all VK credentials failed: %w", lastErr)
+}
+
+func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer) (string, string, string, error) {
 	profile := getRandomProfile()
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
 
-	log.Printf("Connecting Identity - Name: %s | User-Agent: %s", name, profile.UserAgent)
+	log.Printf("[STREAM %d] [VK Auth] Connecting Identity - Name: %s | User-Agent: %s", streamID, name, profile.UserAgent)
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
+		parsedURL, _ := neturl.Parse(url)
+		domain := parsedURL.Hostname()
+
 		client := &http.Client{
 			Timeout: 20 * time.Second,
 			Transport: &http.Transport{
@@ -387,17 +683,28 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,
 				DialContext:         dialer.DialContext,
+				TLSClientConfig: &tls.Config{
+					ServerName: domain, // Force SNI for DPI evasion
+				},
 			},
 		}
 		defer client.CloseIdleConnections()
 
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
 			return nil, err
 		}
 
-		req.Header.Add("User-Agent", profile.UserAgent)
-		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		req.Host = domain
+		applyBrowserProfile(req, profile)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Origin", "https://vk.ru")
+		req.Header.Set("Referer", "https://vk.ru/")
+		req.Header.Set("Sec-Fetch-Site", "same-site")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Priority", "u=1, i")
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -418,25 +725,15 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 		if err != nil {
 			return nil, err
 		}
-
 		return resp, nil
 	}
 
-	var resp map[string]interface{}
-	defer func() {
-		if r := recover(); r != nil {
-			log.Panicf("get TURN creds error: %v\n\n", resp)
-		}
-	}()
-
-	data := "client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487"
-	url := "https://login.vk.ru/?act=get_anonym_token"
-
-	resp, err := doRequest(data, url)
+	// Token 1
+	data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s", creds.ClientID, creds.ClientSecret, creds.ClientID)
+	resp, err := doRequest(data, "https://login.vk.ru/?act=get_anonym_token")
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", "", err
 	}
-
 	dataMap, ok := resp["data"].(map[string]interface{})
 	if !ok {
 		return "", "", "", fmt.Errorf("unexpected anon token response: %v", resp)
@@ -446,42 +743,76 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 		return "", "", "", fmt.Errorf("missing access_token in response: %v", resp)
 	}
 
+	vkDelayRandom(100, 200)
+
+	// Token 1 -> getCallPreview
+	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&fields=photo_200&access_token=%s", link, token1)
+	_, _ = doRequest(data, "https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id="+creds.ClientID)
+
+	vkDelayRandom(500, 1000) // HAR: Delay updated
+
+	// Token 2
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
-	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
+	urlAddr := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=%s", creds.ClientID)
 
 	var token2 string
 	const maxCaptchaAttempts = 3
 	for attempt := 0; attempt <= maxCaptchaAttempts; attempt++ {
-		resp, err = doRequest(data, url)
+		resp, err = doRequest(data, urlAddr)
 		if err != nil {
-			return "", "", "", fmt.Errorf("request error:%s", err)
+			return "", "", "", err
 		}
 
-		// Check for captcha error
 		if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
-			errCode, _ := errObj["error_code"].(float64)
-			if errCode == 14 {
-				if attempt == maxCaptchaAttempts {
-					return "", "", "", fmt.Errorf("captcha failed after %d attempts", maxCaptchaAttempts)
-				}
+			captchaErr := ParseVkCaptchaError(errObj)
+			if captchaErr != nil && captchaErr.IsCaptchaError() {
+				var successToken string
+				var captchaKey string
+				var solveErr error
 
-				captchaErr := parseVkCaptchaError(errObj)
-				if captchaErr.SessionToken != "" {
-					successToken, solveErr := solveVkCaptcha(context.Background(), captchaErr, dialer)
+				// Try automatic if possible and attempts remain
+				if attempt < maxCaptchaAttempts && captchaErr.SessionToken != "" && captchaErr.RedirectUri != "" {
+					successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, dialer, profile)
 					if solveErr != nil {
-						return "", "", "", fmt.Errorf("auto captcha solve error: %w", solveErr)
+						log.Printf("[STREAM %d] [Captcha] Auto solve failed: %v. Falling back to manual...", streamID, solveErr)
 					}
-
-					if captchaErr.CaptchaAttempt == "0" || captchaErr.CaptchaAttempt == "" {
-						captchaErr.CaptchaAttempt = "1"
-					}
-
-					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s",
-						link, escapedName, token1, captchaErr.CaptchaSid, neturl.QueryEscape(successToken), captchaErr.CaptchaTs, captchaErr.CaptchaAttempt)
-					continue
+				} else if attempt >= maxCaptchaAttempts {
+					log.Printf("[STREAM %d] [Captcha] Max auto attempts reached. Falling back to manual...", streamID)
+					solveErr = fmt.Errorf("max attempts reached")
 				} else {
-					return "", "", "", fmt.Errorf("old image captcha detected - not supported in auto solver")
+					log.Printf("[STREAM %d] [Captcha] Missing fields for auto solve. Falling back to manual...", streamID)
+					solveErr = fmt.Errorf("missing fields")
 				}
+
+				// If auto failed, or we skipped it, drop to manual fallback
+				if solveErr != nil {
+					if captchaErr.RedirectUri != "" {
+						successToken, solveErr = solveCaptchaViaProxy(captchaErr.RedirectUri, dialer)
+						if solveErr != nil {
+							return "", "", "", fmt.Errorf("manual proxy captcha solve error: %w", solveErr)
+						}
+					} else if captchaErr.CaptchaImg != "" {
+						captchaKey, solveErr = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
+						if solveErr != nil {
+							return "", "", "", fmt.Errorf("manual HTTP captcha solve error: %w", solveErr)
+						}
+					} else {
+						return "", "", "", fmt.Errorf("cannot solve captcha manually: no redirect_uri or captcha_img")
+					}
+				}
+
+				if captchaErr.CaptchaAttempt == "0" || captchaErr.CaptchaAttempt == "" {
+					captchaErr.CaptchaAttempt = "1"
+				}
+
+				if captchaKey != "" {
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&captcha_key=%s&captcha_sid=%s&access_token=%s",
+						link, escapedName, neturl.QueryEscape(captchaKey), captchaErr.CaptchaSid, token1)
+				} else {
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s&access_token=%s",
+						link, escapedName, captchaErr.CaptchaSid, neturl.QueryEscape(successToken), captchaErr.CaptchaTs, captchaErr.CaptchaAttempt, token1)
+				}
+				continue
 			}
 			return "", "", "", fmt.Errorf("VK API error: %v", errObj)
 		}
@@ -497,40 +828,48 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 		break
 	}
 
-	data = fmt.Sprintf("%s%s%s", "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22", uuid.New(), "%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA")
-	url = "https://calls.okcdn.ru/fb.do"
+	vkDelayRandom(100, 200)
 
-	resp, err = doRequest(data, url)
+	// Token 3
+	sessionData := fmt.Sprintf(`{"version":2,"device_id":"%s","client_version":1.1,"client_type":"SDK_JS"}`, uuid.New())
+	data = fmt.Sprintf("session_data=%s&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA", neturl.QueryEscape(sessionData))
+	resp, err = doRequest(data, "https://calls.okcdn.ru/fb.do")
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", "", err
 	}
-
 	token3 := resp["session_key"].(string)
 
-	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token2, token3)
-	url = "https://calls.okcdn.ru/fb.do"
+	vkDelayRandom(100, 200)
 
-	resp, err = doRequest(data, url)
+	// Token 4 -> TURN Creds
+	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token2, token3)
+	resp, err = doRequest(data, "https://calls.okcdn.ru/fb.do")
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", "", err
 	}
 
-	user := resp["turn_server"].(map[string]interface{})["username"].(string)
-	pass := resp["turn_server"].(map[string]interface{})["credential"].(string)
-	turn := resp["turn_server"].(map[string]interface{})["urls"].([]interface{})[0].(string)
+	ts := resp["turn_server"].(map[string]interface{})
+	user := ts["username"].(string)
+	pass := ts["credential"].(string)
+	urls := ts["urls"].([]interface{})
+	urlStr := urls[0].(string)
 
-	clean := strings.Split(turn, "?")[0]
+	clean := strings.Split(urlStr, "?")[0]
 	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
+
+	vkDelayRandom(4000, 5000) // HAR: Final matching delay
 
 	return user, pass, address, nil
 }
+
+// endregion
 
 func getYandexCreds(link string) (string, string, string, error) {
 	const debug = false
 	const telemostConfHost = "cloud-api.yandex.ru"
 	telemostConfPath := fmt.Sprintf("%s%s%s", "/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F", link, "/connection?next_gen_media_platform_allowed=false")
+
 	profile := getRandomProfile()
-	userAgent := profile.UserAgent
 	name := generateName()
 
 	type ConferenceResponse struct {
@@ -659,7 +998,8 @@ func getYandexCreds(link string) (string, string, string, error) {
 	if err != nil {
 		return "", "", "", err
 	}
-	req.Header.Set("User-Agent", userAgent)
+
+	applyBrowserProfile(req, profile)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Referer", "https://telemost.yandex.ru/")
 	req.Header.Set("Origin", "https://telemost.yandex.ru")
@@ -691,7 +1031,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 	}
 	h := http.Header{}
 	h.Set("Origin", "https://telemost.yandex.ru")
-	h.Set("User-Agent", userAgent)
+	h.Set("User-Agent", profile.UserAgent)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -733,7 +1073,7 @@ func getYandexCreds(link string) (string, string, string, error) {
 			SdkInfo: SdkInfo{
 				Implementation: "browser",
 				Version:        "5.15.0",
-				UserAgent:      userAgent,
+				UserAgent:      profile.UserAgent,
 				HwConcurrency:  4,
 			},
 			SdkInitializationID:    uuid.New().String(),
@@ -876,7 +1216,6 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 	}()
 	log.Printf("Established DTLS connection!\n")
 
-	// Trigger the okchan safely to spawn the rest of the threads
 	if okchan != nil {
 		go func() {
 			select {
@@ -897,7 +1236,6 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 		}
 	})
 
-	// Start read-loop on listenConn
 	go func() {
 		defer wg.Done()
 		defer dtlscancel()
@@ -914,7 +1252,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 				return
 			}
 
-			globalClientWGAddr.Store(addr1) // store local WG peer address globally
+			globalClientWGAddr.Store(addr1)
 
 			_, err1 = dtlsConn.Write(buf[:n])
 			if err1 != nil {
@@ -924,7 +1262,6 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 		}
 	}()
 
-	// Start read-loop on dtlsConn
 	go func() {
 		defer wg.Done()
 		defer dtlscancel()
@@ -943,7 +1280,6 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 
 			addr1, ok := globalClientWGAddr.Load().(net.Addr)
 			if !ok {
-				// Safely drop packet if wireguard hasn't sent an initial packet yet
 				continue
 			}
 
@@ -980,16 +1316,16 @@ type turnParams struct {
 	getCreds getCredsFunc
 }
 
-func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
+func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, streamID int, c chan<- error) {
 	time.Sleep(time.Duration(rand.Intn(400)+100) * time.Millisecond)
 	var err error = nil
 	defer func() { c <- err }()
-	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
+	user, pass, urlTarget, err1 := turnParams.getCreds(ctx, turnParams.link, streamID)
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
 		return
 	}
-	urlhost, urlport, err1 := net.SplitHostPort(url)
+	urlhost, urlport, err1 := net.SplitHostPort(urlTarget)
 	if err1 != nil {
 		err = fmt.Errorf("failed to parse TURN server address: %s", err1)
 		return
@@ -1008,8 +1344,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		return
 	}
 	turnServerAddr = turnServerUdpAddr.String()
-	fmt.Println(turnServerUdpAddr.IP)
-	// Dial TURN Server
+
 	var cfg *turn.ClientConfig
 	var turnConn net.PacketConn
 	var d net.Dialer
@@ -1048,8 +1383,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	} else {
 		addrFamily = turn.RequestedAddressFamilyIPv6
 	}
-	// Start a new TURN Client and wrap our net.Conn in a STUNConn
-	// This allows us to simulate datagram based communication over a net.Conn
+
 	cfg = &turn.ClientConfig{
 		STUNServerAddr:         turnServerAddr,
 		TURNServerAddr:         turnServerAddr,
@@ -1068,18 +1402,17 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 	defer client.Close()
 
-	// Start listening on the conn provided.
 	err1 = client.Listen()
 	if err1 != nil {
 		err = fmt.Errorf("failed to listen: %s", err1)
 		return
 	}
 
-	// Allocate a relay socket on the TURN server. On success, it
-	// will return a net.PacketConn which represents the remote
-	// socket.
 	relayConn, err1 := client.Allocate()
 	if err1 != nil {
+		if isAuthError(err1) {
+			handleAuthError(streamID)
+		}
 		err = fmt.Errorf("failed to allocate: %s", err1)
 		return
 	}
@@ -1089,9 +1422,10 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}
 	}()
 
-	// The relayConn's local address is actually the transport
-	// address assigned on the TURN server.
-	log.Printf("relayed-address=%s", relayConn.LocalAddr().String())
+	// Reset error count on successful allocation
+	getStreamCache(streamID).errorCount.Store(0)
+
+	log.Printf("[STREAM %d] relayed-address=%s", streamID, relayConn.LocalAddr().String())
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)
@@ -1105,7 +1439,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}
 	})
 	var internalPipeAddr atomic.Value
-	// Start read-loop on conn2 (output of DTLS)
+
 	go func() {
 		defer wg.Done()
 		defer turncancel()
@@ -1122,7 +1456,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				return
 			}
 
-			internalPipeAddr.Store(addr1) // store local async pipe peer
+			internalPipeAddr.Store(addr1)
 
 			_, err1 = relayConn.WriteTo(buf[:n], peer)
 			if err1 != nil {
@@ -1132,7 +1466,6 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}
 	}()
 
-	// Start read-loop on relayConn
 	go func() {
 		defer wg.Done()
 		defer turncancel()
@@ -1186,84 +1519,27 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 	}
 }
 
-func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan net.PacketConn, t <-chan time.Time) {
+func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan net.PacketConn, t <-chan time.Time, streamID int) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case conn2 := <-connchan:
-			// Ensure we block cleanly until the tick signals to proceed
 			select {
 			case <-t:
 			case <-ctx.Done():
 				return
 			}
 			c := make(chan error)
-			go oneTurnConnection(ctx, turnParams, peer, conn2, c)
+			go oneTurnConnection(ctx, turnParams, peer, conn2, streamID, c)
 			if err := <-c; err != nil {
-				log.Printf("%s", err)
+				log.Printf("[STREAM %d] %s", streamID, err)
 			}
 		}
 	}
 }
 
-type turnCred struct {
-	user, pass, addr string
-}
-
-// poolCreds allows retrieving unique TURN credentials for N distinct connections.
-// Because it natively handles the automatic captcha bypass, every request gets a unique identity safely.
-func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
-	var mu sync.Mutex
-	var pool []turnCred
-	var cTime time.Time
-	var idx int
-
-	return func(link string) (string, string, string, error) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		// Refresh identities every 10 minutes
-		if !cTime.IsZero() && time.Since(cTime) > 10*time.Minute {
-			pool = nil
-			cTime = time.Time{}
-		}
-
-		if len(pool) < poolSize {
-			u, p, a, err := f(link)
-			if err == nil {
-				pool = append(pool, turnCred{u, p, a})
-				cTime = time.Now()
-				log.Printf("Successfully registered User Identity %d/%d", len(pool), poolSize)
-
-				// Space out requests by 1000ms to avoid API limits
-				if len(pool) < poolSize {
-					time.Sleep(1000 * time.Millisecond)
-				}
-
-				c := pool[len(pool)-1]
-				idx++
-				return c.user, c.pass, c.addr, nil
-			}
-
-			log.Printf("Failed to get unique TURN identity: %v", err)
-			if len(pool) > 0 {
-				log.Printf("Falling back to reusing a previous identity...")
-				c := pool[idx%len(pool)]
-				idx++
-				return c.user, c.pass, c.addr, nil
-			}
-			return "", "", "", err
-		}
-
-		c := pool[idx%len(pool)]
-		idx++
-		return c.user, c.pass, c.addr, nil
-	}
-}
-
-func main() { //nolint:cyclop
-	rand.Seed(time.Now().UnixNano())
+func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signalChan := make(chan os.Signal, 1)
@@ -1288,7 +1564,6 @@ func main() { //nolint:cyclop
 	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
-	tcpMode := flag.Bool("tcp", false, "TCP mode: forward TCP connections (for VLESS) instead of UDP packets")
 	flag.Parse()
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -1308,13 +1583,13 @@ func main() { //nolint:cyclop
 		link = parts[len(parts)-1]
 
 		dialer := dnsdialer.New(
-			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53"),
+			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"),
 			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
 			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
 		)
 
-		getCreds = func(s string) (string, string, string, error) {
-			return getVkCreds(s, dialer)
+		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
+			return getVkCredsCached(ctx, s, streamID, dialer)
 		}
 		if *n <= 0 {
 			*n = 10
@@ -1322,7 +1597,9 @@ func main() { //nolint:cyclop
 	} else {
 		parts := strings.Split(*yalink, "j/")
 		link = parts[len(parts)-1]
-		getCreds = getYandexCreds
+		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
+			return getYandexCreds(s)
+		}
 		if *n <= 0 {
 			*n = 1
 		}
@@ -1330,17 +1607,13 @@ func main() { //nolint:cyclop
 	if idx := strings.IndexAny(link, "/?#"); idx != -1 {
 		link = link[:idx]
 	}
+
 	params := &turnParams{
 		host:     *host,
 		port:     *port,
 		link:     link,
 		udp:      *udp,
-		getCreds: poolCreds(getCreds, *n),
-	}
-
-	if *tcpMode {
-		runTCPMode(ctx, params, peer, *listen, *n)
-		return
+		getCreds: getCreds,
 	}
 
 	listenConnChan := make(chan net.PacketConn)
@@ -1368,10 +1641,10 @@ func main() { //nolint:cyclop
 	if *direct {
 		for i := 0; i < *n; i++ {
 			wg1.Add(1)
-			go func() {
+			go func(streamID int) {
 				defer wg1.Done()
-				oneTurnConnectionLoop(ctx, params, peer, listenConnChan, t)
-			}()
+				oneTurnConnectionLoop(ctx, params, peer, listenConnChan, t, streamID)
+			}(i)
 		}
 	} else {
 		okchan := make(chan struct{})
@@ -1386,7 +1659,7 @@ func main() { //nolint:cyclop
 		wg1.Add(1)
 		go func() {
 			defer wg1.Done()
-			oneTurnConnectionLoop(ctx, params, peer, connchan, t)
+			oneTurnConnectionLoop(ctx, params, peer, connchan, t, 0)
 		}()
 
 		select {
@@ -1401,358 +1674,12 @@ func main() { //nolint:cyclop
 				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil)
 			}()
 			wg1.Add(1)
-			go func() {
+			go func(streamID int) {
 				defer wg1.Done()
-				oneTurnConnectionLoop(ctx, params, peer, connchan, t)
-			}()
+				oneTurnConnectionLoop(ctx, params, peer, connchan, t, streamID)
+			}(i + 1)
 		}
 	}
 
 	wg1.Wait()
-}
-
-// sessionPool manages a pool of smux sessions for round-robin TCP distribution.
-type sessionPool struct {
-	mu       sync.RWMutex
-	sessions []*smux.Session
-	counter  atomic.Uint64
-}
-
-func (p *sessionPool) add(s *smux.Session) {
-	p.mu.Lock()
-	p.sessions = append(p.sessions, s)
-	p.mu.Unlock()
-}
-
-func (p *sessionPool) remove(s *smux.Session) {
-	p.mu.Lock()
-	for i, sess := range p.sessions {
-		if sess == s {
-			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
-			break
-		}
-	}
-	p.mu.Unlock()
-}
-
-func (p *sessionPool) pick() *smux.Session {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	n := len(p.sessions)
-	if n == 0 {
-		return nil
-	}
-	idx := p.counter.Add(1) % uint64(n)
-	return p.sessions[idx]
-}
-
-func (p *sessionPool) count() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.sessions)
-}
-
-// runTCPMode implements TCP forwarding with round-robin across N TURN sessions.
-func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
-	pool := &sessionPool{}
-
-	// Start N session maintainers with staggered startup
-	var wgMaint sync.WaitGroup
-	for i := 0; i < numSessions; i++ {
-		wgMaint.Add(1)
-		go func(id int) {
-			defer wgMaint.Done()
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
-			}
-			maintainTCPSession(ctx, tp, peer, id, pool)
-		}(i)
-	}
-
-	// Wait for at least one session
-	log.Printf("TCP mode: waiting for sessions to connect (total: %d)...", numSessions)
-	for {
-		select {
-		case <-ctx.Done():
-			wgMaint.Wait()
-			return
-		case <-time.After(100 * time.Millisecond):
-		}
-		if pool.count() > 0 {
-			break
-		}
-	}
-
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Panicf("TCP listen: %s", err)
-	}
-	context.AfterFunc(ctx, func() { listener.Close() })
-	log.Printf("TCP mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
-
-	var wgConn sync.WaitGroup
-	for {
-		tcpConn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				wgConn.Wait()
-				wgMaint.Wait()
-				return
-			default:
-			}
-			log.Printf("TCP accept error: %s", err)
-			continue
-		}
-
-		sess := pool.pick()
-		if sess == nil || sess.IsClosed() {
-			log.Printf("No active sessions, rejecting connection")
-			tcpConn.Close()
-			continue
-		}
-
-		wgConn.Add(1)
-		go func(tc net.Conn, s *smux.Session) {
-			defer wgConn.Done()
-			defer tc.Close()
-			stream, err := s.OpenStream()
-			if err != nil {
-				log.Printf("smux open stream error: %s", err)
-				return
-			}
-			defer stream.Close()
-			pipe(ctx, tc, stream)
-		}(tcpConn, sess)
-	}
-}
-
-// maintainTCPSession keeps one TURN+DTLS+KCP+smux session alive, reconnecting on failure.
-func maintainTCPSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer)
-		if err != nil {
-			log.Printf("[session %d] setup error: %s, retrying...", id, err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(3 * time.Second):
-			}
-			continue
-		}
-
-		pool.add(smuxSess)
-		log.Printf("[session %d] connected (active: %d)", id, pool.count())
-
-		for !smuxSess.IsClosed() {
-			select {
-			case <-ctx.Done():
-				pool.remove(smuxSess)
-				cleanup()
-				return
-			case <-time.After(1 * time.Second):
-			}
-		}
-
-		pool.remove(smuxSess)
-		cleanup()
-		log.Printf("[session %d] disconnected (active: %d), reconnecting...", id, pool.count())
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
-}
-
-// createSmuxSession establishes a full TURN+DTLS+KCP+smux pipeline and returns
-// the smux session along with a cleanup function to tear down all layers.
-func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr) (*smux.Session, func(), error) {
-	var cleanupFns []func()
-	cleanup := func() {
-		for i := len(cleanupFns) - 1; i >= 0; i-- {
-			cleanupFns[i]()
-		}
-	}
-
-	// 1. Get TURN credentials
-	user, pass, rawURL, err := tp.getCreds(tp.link)
-	if err != nil {
-		return nil, nil, fmt.Errorf("get TURN creds: %w", err)
-	}
-	urlhost, urlport, err := net.SplitHostPort(rawURL)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse TURN addr: %w", err)
-	}
-	if tp.host != "" {
-		urlhost = tp.host
-	}
-	if tp.port != "" {
-		urlport = tp.port
-	}
-	turnServerAddr := net.JoinHostPort(urlhost, urlport)
-	turnServerUdpAddr, err := net.ResolveUDPAddr("udp", turnServerAddr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("resolve TURN addr: %w", err)
-	}
-	turnServerAddr = turnServerUdpAddr.String()
-
-	// 2. Connect to TURN server
-	var turnConn net.PacketConn
-	ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel1()
-	if tp.udp {
-		conn, err := net.DialUDP("udp", nil, turnServerUdpAddr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dial TURN (udp): %w", err)
-		}
-		cleanupFns = append(cleanupFns, func() { conn.Close() })
-		turnConn = &connectedUDPConn{conn}
-	} else {
-		var d net.Dialer
-		conn, err := d.DialContext(ctx1, "tcp", turnServerAddr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dial TURN (tcp): %w", err)
-		}
-		cleanupFns = append(cleanupFns, func() { conn.Close() })
-		turnConn = turn.NewSTUNConn(conn)
-	}
-
-	// 3. Create TURN client and allocate relay
-	var addrFamily turn.RequestedAddressFamily
-	if peer.IP.To4() != nil {
-		addrFamily = turn.RequestedAddressFamilyIPv4
-	} else {
-		addrFamily = turn.RequestedAddressFamilyIPv6
-	}
-	cfg := &turn.ClientConfig{
-		STUNServerAddr:         turnServerAddr,
-		TURNServerAddr:         turnServerAddr,
-		Conn:                   turnConn,
-		Net:                    newDirectNet(),
-		Username:               user,
-		Password:               pass,
-		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          logging.NewDefaultLoggerFactory(),
-	}
-	turnClient, err := turn.NewClient(cfg)
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("create TURN client: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { turnClient.Close() })
-	if err = turnClient.Listen(); err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("TURN listen: %w", err)
-	}
-	relayConn, err := turnClient.Allocate()
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("TURN allocate: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { relayConn.Close() })
-	log.Printf("relayed-address=%s", relayConn.LocalAddr().String())
-
-	// 4. Establish DTLS over TURN relay
-	certificate, err := selfsign.GenerateSelfSigned()
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("generate cert: %w", err)
-	}
-	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer}
-	dtlsConfig := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		InsecureSkipVerify:    true,
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
-	}
-	dtlsConn, err := dtls.Client(dtlsPC, peer, dtlsConfig)
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("DTLS client create: %w", err)
-	}
-	ctx2, cancel2 := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel2()
-	if err = dtlsConn.HandshakeContext(ctx2); err != nil {
-		dtlsConn.Close()
-		cleanup()
-		return nil, nil, fmt.Errorf("DTLS handshake: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { dtlsConn.Close() })
-	log.Printf("DTLS connection established")
-
-	// 5. Create KCP session over DTLS
-	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("KCP session: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { kcpSess.Close() })
-	log.Printf("KCP session established")
-
-	// 6. Create smux client session over KCP
-	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("smux client: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { smuxSess.Close() })
-	log.Printf("smux session established")
-
-	return smuxSess, cleanup, nil
-}
-
-// relayPacketConn wraps a TURN relay PacketConn to direct all writes to the peer.
-type relayPacketConn struct {
-	relay net.PacketConn
-	peer  net.Addr
-}
-
-func (r *relayPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	return r.relay.ReadFrom(b)
-}
-
-func (r *relayPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
-	return r.relay.WriteTo(b, r.peer)
-}
-
-func (r *relayPacketConn) Close() error                       { return r.relay.Close() }
-func (r *relayPacketConn) LocalAddr() net.Addr                { return r.relay.LocalAddr() }
-func (r *relayPacketConn) SetDeadline(t time.Time) error      { return r.relay.SetDeadline(t) }
-func (r *relayPacketConn) SetReadDeadline(t time.Time) error  { return r.relay.SetReadDeadline(t) }
-func (r *relayPacketConn) SetWriteDeadline(t time.Time) error { return r.relay.SetWriteDeadline(t) }
-
-// pipe copies data bidirectionally between two connections.
-func pipe(ctx context.Context, c1, c2 net.Conn) {
-	ctx2, cancel := context.WithCancel(ctx)
-	context.AfterFunc(ctx2, func() {
-		c1.SetDeadline(time.Now())
-		c2.SetDeadline(time.Now())
-	})
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		io.Copy(c1, c2)
-	}()
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		io.Copy(c2, c1)
-	}()
-	wg.Wait()
-	c1.SetDeadline(time.Time{})
-	c2.SetDeadline(time.Time{})
 }
