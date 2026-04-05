@@ -12,7 +12,7 @@ type Profile struct {
 }
 
 // profiles contain paired User-Agent and Client Hints strings to harden bot detection.
-var profiles = []Profile{
+var profile = []Profile{
 	// Windows Chrome
 	{
 		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -78,5 +78,5 @@ var profiles = []Profile{
 
 // getRandomProfile returns a paired User-Agent and Client Hints profile.
 func getRandomProfile() Profile {
-	return profiles[rand.Intn(len(profiles))]
+	return profile[rand.Intn(len(profile))]
 }

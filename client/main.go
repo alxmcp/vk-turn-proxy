@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -18,7 +19,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	neturl "net/url"
 	"os"
 	"os/signal"
@@ -29,6 +29,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	tlsclient "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/cbeuw/connutil"
@@ -54,17 +58,20 @@ type directListenConfig struct {
 }
 
 // Global state trackers
-var globalClientWGAddr atomic.Value
-var globalCaptchaLockout atomic.Int64
-var connectedStreams atomic.Int32
-var globalAppCancel context.CancelFunc
+var (
+	globalClientWGAddr   atomic.Value
+	globalCaptchaLockout atomic.Int64
+	connectedStreams     atomic.Int32
+	globalAppCancel      context.CancelFunc
+	handshakeSem         = make(chan struct{}, 3)
+)
 
 func newDirectNet() transport.Net {
 	return directNet{}
 }
 
 func (directNet) ListenPacket(network string, address string) (net.PacketConn, error) {
-	return net.ListenPacket(network, address) //nolint:noctx
+	return net.ListenPacket(network, address)
 }
 
 func (directNet) ListenUDP(network string, locAddr *net.UDPAddr) (transport.UDPConn, error) {
@@ -81,7 +88,7 @@ func (directNet) ListenTCP(network string, laddr *net.TCPAddr) (transport.TCPLis
 }
 
 func (directNet) Dial(network, address string) (net.Conn, error) {
-	return net.Dial(network, address) //nolint:noctx
+	return net.Dial(network, address)
 }
 
 func (directNet) DialUDP(network string, laddr, raddr *net.UDPAddr) (transport.UDPConn, error) {
@@ -156,16 +163,56 @@ func applyBrowserProfile(req *http.Request, profile Profile) {
 	req.Header.Set("DNT", "1")
 }
 
+func applyBrowserProfileFhttp(req *fhttp.Request, profile Profile) {
+	req.Header.Set("User-Agent", profile.UserAgent)
+	req.Header.Set("sec-ch-ua", profile.SecChUa)
+	req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
+	req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("DNT", "1")
+}
+
+func generateBrowserFp(profile Profile) string {
+	data := profile.UserAgent + profile.SecChUa + "1920x1080x24"
+	h := md5.Sum([]byte(data))
+	return hex.EncodeToString(h[:])
+}
+
 func generateFakeCursor() string {
-	startX := 800 + rand.Intn(200)
-	startY := 400 + rand.Intn(200)
+	startX := 600 + rand.Intn(400)
+	startY := 300 + rand.Intn(200)
+	startTime := time.Now().UnixMilli() - int64(rand.Intn(2000)+1000)
 	var points []string
-	for i := 0; i < 5+rand.Intn(5); i++ {
-		startX += rand.Intn(10) - 2
-		startY += rand.Intn(10) - 2
-		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d}`, startX, startY))
+	for i := 0; i < 15+rand.Intn(10); i++ {
+		startX += rand.Intn(15) - 5
+		startY += rand.Intn(15) + 2
+		startTime += int64(rand.Intn(40) + 10)
+		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, startX, startY, startTime))
 	}
 	return "[" + strings.Join(points, ",") + "]"
+}
+
+func getCustomNetDialer() net.Dialer {
+	return net.Dialer{
+		Timeout:   20 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver: &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				var d net.Dialer
+				dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+				var lastErr error
+				for _, dns := range dnsServers {
+					conn, err := d.DialContext(ctx, "udp", dns)
+					if err == nil {
+						return conn, nil
+					}
+					lastErr = err
+				}
+				return nil, lastErr
+			},
+		},
+	}
 }
 
 // endregion
@@ -239,7 +286,7 @@ func (e *VkCaptchaError) IsCaptchaError() bool {
 	return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
 }
 
-func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, dialer *dnsdialer.Dialer, jar *cookiejar.Jar, profile Profile) (string, error) {
+func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
 	log.Printf("[STREAM %d] [Captcha] Solving Not Robot Captcha...", streamID)
 
 	if captchaErr.SessionToken == "" {
@@ -249,7 +296,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 		return "", fmt.Errorf("no redirect_uri for auto-solve")
 	}
 
-	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, dialer, jar, profile)
+	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, client, profile)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PoW input: %w", err)
 	}
@@ -259,7 +306,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 	hash := solvePoW(powInput, difficulty)
 	log.Printf("[STREAM %d] [Captcha] PoW solved: hash=%s", streamID, hash)
 
-	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, dialer, jar, profile)
+	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, client, profile)
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 	}
@@ -268,35 +315,25 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 	return successToken, nil
 }
 
-func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Dialer, jar *cookiejar.Jar, profile Profile) (string, int, error) {
+func fetchPowInput(ctx context.Context, redirectUri string, client tlsclient.HttpClient, profile Profile) (string, int, error) {
 	parsedURL, err := neturl.Parse(redirectUri)
 	if err != nil {
 		return "", 0, err
 	}
 	domain := parsedURL.Hostname()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", redirectUri, nil)
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", redirectUri, nil)
 	if err != nil {
 		return "", 0, err
 	}
 
 	req.Host = domain
-	applyBrowserProfile(req, profile)
+	applyBrowserProfileFhttp(req, profile)
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
-	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Jar:     jar,
-		Transport: &http.Transport{
-			DialContext: dialer.DialContext,
-			TLSClientConfig: &tls.Config{
-				ServerName: domain, // Force SNI for DPI evasion
-			},
-		},
-	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, err
@@ -342,19 +379,19 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, dialer *dnsdialer.Dialer, jar *cookiejar.Jar, profile Profile) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		parsedURL, _ := neturl.Parse(reqURL)
 		domain := parsedURL.Hostname()
 
-		req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
+		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err
 		}
 
 		req.Host = domain
-		applyBrowserProfile(req, profile)
+		applyBrowserProfileFhttp(req, profile)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
 		req.Header.Set("Origin", "https://id.vk.ru")
@@ -364,17 +401,6 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		req.Header.Set("Sec-Fetch-Dest", "empty")
 		req.Header.Set("Sec-GPC", "1")
 		req.Header.Set("Priority", "u=1, i")
-
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			Jar:     jar,
-			Transport: &http.Transport{
-				DialContext: dialer.DialContext,
-				TLSClientConfig: &tls.Config{
-					ServerName: domain, // Enforce SNI for DPI evasion
-				},
-			},
-		}
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -405,8 +431,8 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
-	browserFp := fmt.Sprintf("%032x", rand.Int63())
-	deviceJSON := `{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1032,"innerWidth":1920,"innerHeight":945,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":16,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"denied"}`
+	browserFp := generateBrowserFp(profile)
+	deviceJSON := fmt.Sprintf(`{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1040,"innerWidth":1920,"innerHeight":969,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`, profile.UserAgent)
 	componentDoneData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, neturl.QueryEscape(deviceJSON))
 
 	if _, err := vkReq("captchaNotRobot.componentDone", componentDoneData); err != nil {
@@ -418,14 +444,18 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
 	cursorJSON := generateFakeCursor()
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
-	debugInfo := "d44f534ce8deb56ba20be52e05c433309b49ee4d2a70602deeb17a1954257785"
 
+	// Dynamically generate debug_info to avoid static fingerprint bans
+	debugInfoBytes := md5.Sum([]byte(profile.UserAgent + strconv.FormatInt(time.Now().UnixNano(), 10)))
+	debugInfo := hex.EncodeToString(debugInfoBytes[:])
+
+	connectionRtt := "[50,50,50,50,50,50,50,50,50,50]"
 	connectionDownlink := "[9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5]"
 
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
 		neturl.QueryEscape("[]"), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
-		neturl.QueryEscape(cursorJSON), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
+		neturl.QueryEscape(cursorJSON), neturl.QueryEscape("[]"), neturl.QueryEscape(connectionRtt),
 		neturl.QueryEscape(connectionDownlink),
 		browserFp, hash, answer, debugInfo,
 	)
@@ -503,7 +533,10 @@ func getCacheID(streamID int) int {
 	return streamID / streamsPerCache
 }
 
-var vkRequestMu sync.Mutex
+var (
+	vkRequestMu           sync.Mutex
+	globalLastVkFetchTime time.Time
+)
 
 func vkDelayRandom(minMs, maxMs int) {
 	ms := minMs + rand.Intn(maxMs-minMs+1)
@@ -638,6 +671,25 @@ func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dn
 func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
 	vkRequestMu.Lock()
 	defer vkRequestMu.Unlock()
+
+	// Ensure a minimum cooldown between credential requests to avoid VK rate limits
+	minInterval := 10*time.Second + time.Duration(rand.Intn(30000))*time.Millisecond
+	elapsed := time.Since(globalLastVkFetchTime)
+
+	if !globalLastVkFetchTime.IsZero() && elapsed < minInterval {
+		wait := minInterval - elapsed
+		log.Printf("[STREAM %d] [VK Auth] Throttling: waiting %v to prevent rate limit...", streamID, wait.Truncate(time.Millisecond))
+		select {
+		case <-ctx.Done():
+			return "", "", "", ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+
+	defer func() {
+		globalLastVkFetchTime = time.Now()
+	}()
+
 	return fetchVkCreds(ctx, link, streamID, dialer)
 }
 
@@ -648,7 +700,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	}
 
 	var lastErr error
-	jar, _ := cookiejar.New(nil)
+	jar := tlsclient.NewCookieJar()
 
 	for _, creds := range vkCredentialsList {
 		log.Printf("[STREAM %d] [VK Auth] Trying credentials: client_id=%s", streamID, creds.ClientID)
@@ -676,8 +728,24 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	return "", "", "", fmt.Errorf("all VK credentials failed: %w", lastErr)
 }
 
-func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar *cookiejar.Jar) (string, string, string, error) {
-	profile := getRandomProfile()
+func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar tlsclient.CookieJar) (string, string, string, error) {
+	profile := Profile{
+		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		SecChUa:         `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`,
+		SecChUaMobile:   "?0",
+		SecChUaPlatform: `"Windows"`,
+	}
+
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
+		tlsclient.WithTimeoutSeconds(20),
+		tlsclient.WithClientProfile(profiles.Chrome_120),
+		tlsclient.WithCookieJar(jar),
+		tlsclient.WithDialer(getCustomNetDialer()),
+	)
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to initialize tls_client: %w", err)
+	}
+
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
 
@@ -687,27 +755,13 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		parsedURL, _ := neturl.Parse(url)
 		domain := parsedURL.Hostname()
 
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			Jar:     jar,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-				DialContext:         dialer.DialContext,
-				TLSClientConfig: &tls.Config{
-					ServerName: domain, // Force SNI for DPI evasion
-				},
-			},
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
+		req, err := fhttp.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
 			return nil, err
 		}
 
 		req.Host = domain
-		applyBrowserProfile(req, profile)
+		applyBrowserProfileFhttp(req, profile)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
 		req.Header.Set("Origin", "https://vk.ru")
@@ -784,7 +838,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 				if attempt < maxAutoAttempts {
 					// Auto Solve Attempts
 					if captchaErr.SessionToken != "" && captchaErr.RedirectUri != "" {
-						successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, dialer, jar, profile)
+						successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, client, profile)
 						if solveErr != nil {
 							log.Printf("[STREAM %d] [Captcha] Auto solve failed: %v", streamID, solveErr)
 						}
@@ -1235,7 +1289,15 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
 	}
-	ctx1, cancel := context.WithTimeout(ctx, 30*time.Second)
+
+	select {
+	case handshakeSem <- struct{}{}:
+		defer func() { <-handshakeSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	ctx1, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	dtlsConn, err := dtls.Client(conn, peer, config)
 	if err != nil {
@@ -1414,7 +1476,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	ctx1, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if turnParams.udp {
-		conn, err2 := net.DialUDP("udp", nil, turnServerUdpAddr) // nolint: noctx
+		conn, err2 := net.DialUDP("udp", nil, turnServerUdpAddr)
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
@@ -1427,7 +1489,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}()
 		turnConn = &connectedUDPConn{conn}
 	} else {
-		conn, err2 := d.DialContext(ctx1, "tcp", turnServerAddr) // nolint: noctx
+		conn, err2 := d.DialContext(ctx1, "tcp", turnServerAddr)
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
@@ -1584,7 +1646,13 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 				if time.Now().Unix() < globalCaptchaLockout.Load() && strings.Contains(err.Error(), "context deadline exceeded") {
 					continue
 				}
-				log.Printf("%s", err)
+				log.Printf("[DTLS] Handshake failed, retrying in background: %v", err)
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Duration(10+rand.Intn(20)) * time.Second):
+				}
 			}
 		}
 	}
@@ -1722,7 +1790,7 @@ func main() {
 	}
 
 	listenConnChan := make(chan net.PacketConn)
-	listenConn, err := net.ListenPacket("udp", *listen) // nolint: noctx
+	listenConn, err := net.ListenPacket("udp", *listen)
 	if err != nil {
 		log.Panicf("Failed to listen: %s", err)
 	}
