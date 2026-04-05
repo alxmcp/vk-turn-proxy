@@ -220,7 +220,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 }
 
 func (e *VkCaptchaError) IsCaptchaError() bool {
-	return e.ErrorCode == 14
+	return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
 }
 
 func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, error) {
@@ -233,10 +233,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 		return "", fmt.Errorf("no redirect_uri for auto-solve")
 	}
 
-	// HAR Timing: Browser page load & user perception
-	time.Sleep(1500*time.Millisecond + time.Duration(rand.Intn(1000))*time.Millisecond)
-
-	powInput, difficulty, cookies, err := fetchPowInput(ctx, captchaErr.RedirectUri, streamID, dialer, profile)
+	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, dialer, profile)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PoW input: %w", err)
 	}
@@ -246,7 +243,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 	hash := solvePoW(powInput, difficulty)
 	log.Printf("[STREAM %d] [Captcha] PoW solved: hash=%s", streamID, hash)
 
-	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, cookies, streamID, dialer, profile)
+	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, dialer, profile)
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 	}
@@ -255,16 +252,16 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 	return successToken, nil
 }
 
-func fetchPowInput(ctx context.Context, redirectUri string, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, int, string, error) {
+func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Dialer, profile Profile) (string, int, error) {
 	parsedURL, err := neturl.Parse(redirectUri)
 	if err != nil {
-		return "", 0, "", err
+		return "", 0, err
 	}
 	domain := parsedURL.Hostname()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", redirectUri, nil)
 	if err != nil {
-		return "", 0, "", err
+		return "", 0, err
 	}
 
 	req.Host = domain // Explicitly force Host header
@@ -285,32 +282,22 @@ func fetchPowInput(ctx context.Context, redirectUri string, streamID int, dialer
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, "", err
+		return "", 0, err
 	}
 	defer func(Body io.ReadCloser) {
 		_ = Body.Close()
 	}(resp.Body)
 
-	var cookies []string
-	for _, setCookie := range resp.Header.Values("Set-Cookie") {
-		cookieParts := strings.Split(setCookie, ";")
-		cookies = append(cookies, strings.TrimSpace(cookieParts[0]))
-	}
-	cookieHeader := strings.Join(cookies, "; ")
-	if cookieHeader != "" {
-		log.Printf("[STREAM %d] [Captcha] Captcha page set %d cookie(s)", streamID, len(cookies))
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", 0, "", err
+		return "", 0, err
 	}
 	html := string(body)
 
 	powInputRe := regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
 	powInputMatch := powInputRe.FindStringSubmatch(html)
 	if len(powInputMatch) < 2 {
-		return "", 0, "", fmt.Errorf("powInput not found in captcha HTML")
+		return "", 0, fmt.Errorf("powInput not found in captcha HTML")
 	}
 	powInput := powInputMatch[1]
 
@@ -322,7 +309,7 @@ func fetchPowInput(ctx context.Context, redirectUri string, streamID int, dialer
 			difficulty = d
 		}
 	}
-	return powInput, difficulty, cookieHeader, nil
+	return powInput, difficulty, nil
 }
 
 func solvePoW(powInput string, difficulty int) string {
@@ -338,7 +325,7 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, cookies string, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		parsedURL, _ := neturl.Parse(reqURL)
@@ -358,11 +345,8 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, cookies string
 		req.Header.Set("Sec-Fetch-Site", "same-site")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-GPC", "1")
 		req.Header.Set("Priority", "u=1, i")
-
-		if cookies != "" {
-			req.Header.Set("Cookie", cookies)
-		}
 
 		client := &http.Client{
 			Timeout: 20 * time.Second,
@@ -400,11 +384,10 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, cookies string
 		return "", fmt.Errorf("settings failed: %w", err)
 	}
 
-	// HAR Timing: settings -> componentDone
-	time.Sleep(100*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
-	browserFp := fmt.Sprintf("%016x%016x", rand.Int63(), rand.Int63())
+	browserFp := fmt.Sprintf("%032x", rand.Int63())
 	deviceJSON := `{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1032,"innerWidth":1920,"innerHeight":945,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":16,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"denied"}`
 	componentDoneData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, neturl.QueryEscape(deviceJSON))
 
@@ -412,17 +395,14 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, cookies string
 		return "", fmt.Errorf("componentDone failed: %w", err)
 	}
 
-	// HAR Timing: componentDone -> check ≈ 1.95s + statEvents delay ≈ 3.2s total
-	time.Sleep(1950*time.Millisecond + time.Duration(rand.Intn(1250))*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
 	cursorJSON := `[{"x":950,"y":500},{"x":945,"y":510},{"x":940,"y":520},{"x":938,"y":525},{"x":938,"y":525}]`
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 	debugInfo := "d44f534ce8deb56ba20be52e05c433309b49ee4d2a70602deeb17a1954257785"
 
-	baseDownlink := 8.0 + rand.Float64()*4.0
-	downlinkStr := fmt.Sprintf("%.1f", baseDownlink)
-	connectionDownlink := "[" + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "]"
+	connectionDownlink := "[9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5]"
 
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
@@ -449,6 +429,8 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash, cookies string
 	if !ok || successToken == "" {
 		return "", fmt.Errorf("success_token not found")
 	}
+
+	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 4/4: endSession", streamID)
 	_, err = vkReq("captchaNotRobot.endSession", baseParams)
