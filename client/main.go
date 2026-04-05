@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	neturl "net/url"
 	"os"
 	"os/signal"
@@ -52,8 +53,11 @@ type directListenConfig struct {
 	*net.ListenConfig
 }
 
-// globalClientWGAddr safely stores the UDP address of the local WireGuard client
+// Global state trackers
 var globalClientWGAddr atomic.Value
+var globalCaptchaLockout atomic.Int64
+var connectedStreams atomic.Int32
+var globalAppCancel context.CancelFunc
 
 func newDirectNet() transport.Net {
 	return directNet{}
@@ -152,6 +156,18 @@ func applyBrowserProfile(req *http.Request, profile Profile) {
 	req.Header.Set("DNT", "1")
 }
 
+func generateFakeCursor() string {
+	startX := 800 + rand.Intn(200)
+	startY := 400 + rand.Intn(200)
+	var points []string
+	for i := 0; i < 5+rand.Intn(5); i++ {
+		startX += rand.Intn(10) - 2
+		startY += rand.Intn(10) - 2
+		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d}`, startX, startY))
+	}
+	return "[" + strings.Join(points, ",") + "]"
+}
+
 // endregion
 
 // region Automatic Captcha Solver & Authentication
@@ -223,7 +239,7 @@ func (e *VkCaptchaError) IsCaptchaError() bool {
 	return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
 }
 
-func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, error) {
+func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID int, dialer *dnsdialer.Dialer, jar *cookiejar.Jar, profile Profile) (string, error) {
 	log.Printf("[STREAM %d] [Captcha] Solving Not Robot Captcha...", streamID)
 
 	if captchaErr.SessionToken == "" {
@@ -233,7 +249,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 		return "", fmt.Errorf("no redirect_uri for auto-solve")
 	}
 
-	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, dialer, profile)
+	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, dialer, jar, profile)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PoW input: %w", err)
 	}
@@ -243,7 +259,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 	hash := solvePoW(powInput, difficulty)
 	log.Printf("[STREAM %d] [Captcha] PoW solved: hash=%s", streamID, hash)
 
-	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, dialer, profile)
+	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, dialer, jar, profile)
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 	}
@@ -252,7 +268,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 	return successToken, nil
 }
 
-func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Dialer, profile Profile) (string, int, error) {
+func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Dialer, jar *cookiejar.Jar, profile Profile) (string, int, error) {
 	parsedURL, err := neturl.Parse(redirectUri)
 	if err != nil {
 		return "", 0, err
@@ -264,7 +280,7 @@ func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Di
 		return "", 0, err
 	}
 
-	req.Host = domain // Explicitly force Host header
+	req.Host = domain
 	applyBrowserProfile(req, profile)
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
@@ -273,6 +289,7 @@ func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Di
 
 	client := &http.Client{
 		Timeout: 20 * time.Second,
+		Jar:     jar,
 		Transport: &http.Transport{
 			DialContext: dialer.DialContext,
 			TLSClientConfig: &tls.Config{
@@ -325,7 +342,7 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, dialer *dnsdialer.Dialer, profile Profile) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, dialer *dnsdialer.Dialer, jar *cookiejar.Jar, profile Profile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		parsedURL, _ := neturl.Parse(reqURL)
@@ -350,6 +367,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 
 		client := &http.Client{
 			Timeout: 20 * time.Second,
+			Jar:     jar,
 			Transport: &http.Transport{
 				DialContext: dialer.DialContext,
 				TLSClientConfig: &tls.Config{
@@ -398,7 +416,7 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
-	cursorJSON := `[{"x":950,"y":500},{"x":945,"y":510},{"x":940,"y":520},{"x":938,"y":525},{"x":938,"y":525}]`
+	cursorJSON := generateFakeCursor()
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 	debugInfo := "d44f534ce8deb56ba20be52e05c433309b49ee4d2a70602deeb17a1954257785"
 
@@ -624,12 +642,18 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dial
 }
 
 func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+	// Check Global Lockout to prevent API bans
+	if time.Now().Unix() < globalCaptchaLockout.Load() {
+		return "", "", "", fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
+	}
+
 	var lastErr error
+	jar, _ := cookiejar.New(nil)
 
 	for _, creds := range vkCredentialsList {
 		log.Printf("[STREAM %d] [VK Auth] Trying credentials: client_id=%s", streamID, creds.ClientID)
 
-		user, pass, addr, err := getTokenChain(ctx, link, streamID, creds, dialer)
+		user, pass, addr, err := getTokenChain(ctx, link, streamID, creds, dialer, jar)
 
 		if err == nil {
 			log.Printf("[STREAM %d] [VK Auth] Success with client_id=%s", streamID, creds.ClientID)
@@ -639,6 +663,11 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 		lastErr = err
 		log.Printf("[STREAM %d] [VK Auth] Failed with client_id=%s: %v", streamID, creds.ClientID, err)
 
+		// Hard abort on captcha/fatal conditions instead of trying next creds
+		if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") || strings.Contains(err.Error(), "FATAL_CAPTCHA") {
+			return "", "", "", err
+		}
+
 		if strings.Contains(err.Error(), "error_code:29") || strings.Contains(err.Error(), "error_code: 29") || strings.Contains(err.Error(), "Rate limit") {
 			log.Printf("[STREAM %d] [VK Auth] Rate limit detected, trying next credentials...", streamID)
 		}
@@ -647,7 +676,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	return "", "", "", fmt.Errorf("all VK credentials failed: %w", lastErr)
 }
 
-func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar *cookiejar.Jar) (string, string, string, error) {
 	profile := getRandomProfile()
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
@@ -660,6 +689,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 		client := &http.Client{
 			Timeout: 20 * time.Second,
+			Jar:     jar,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
@@ -670,7 +700,6 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 				},
 			},
 		}
-		defer client.CloseIdleConnections()
 
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
@@ -731,15 +760,15 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&fields=photo_200&access_token=%s", link, token1)
 	_, _ = doRequest(data, "https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id="+creds.ClientID)
 
-	vkDelayRandom(500, 1000) // HAR: Delay updated
+	vkDelayRandom(500, 1000)
 
-	// Token 2
+	// Token 2 (with 2 auto attempts + 1 manual fallback)
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
 	urlAddr := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=%s", creds.ClientID)
 
 	var token2 string
-	const maxCaptchaAttempts = 3
-	for attempt := 0; attempt <= maxCaptchaAttempts; attempt++ {
+	const maxAutoAttempts = 2
+	for attempt := 0; attempt <= maxAutoAttempts+1; attempt++ {
 		resp, err = doRequest(data, urlAddr)
 		if err != nil {
 			return "", "", "", err
@@ -752,35 +781,87 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 				var captchaKey string
 				var solveErr error
 
-				// Try automatic if possible and attempts remain
-				if attempt < maxCaptchaAttempts && captchaErr.SessionToken != "" && captchaErr.RedirectUri != "" {
-					successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, dialer, profile)
-					if solveErr != nil {
-						log.Printf("[STREAM %d] [Captcha] Auto solve failed: %v. Falling back to manual...", streamID, solveErr)
-					}
-				} else if attempt >= maxCaptchaAttempts {
-					log.Printf("[STREAM %d] [Captcha] Max auto attempts reached. Falling back to manual...", streamID)
-					solveErr = fmt.Errorf("max attempts reached")
-				} else {
-					log.Printf("[STREAM %d] [Captcha] Missing fields for auto solve. Falling back to manual...", streamID)
-					solveErr = fmt.Errorf("missing fields")
-				}
-
-				// If auto failed, or we skipped it, drop to manual fallback
-				if solveErr != nil {
-					if captchaErr.RedirectUri != "" {
-						successToken, solveErr = solveCaptchaViaProxy(captchaErr.RedirectUri, dialer)
+				if attempt < maxAutoAttempts {
+					// Auto Solve Attempts
+					if captchaErr.SessionToken != "" && captchaErr.RedirectUri != "" {
+						successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, dialer, jar, profile)
 						if solveErr != nil {
-							return "", "", "", fmt.Errorf("manual proxy captcha solve error: %w", solveErr)
-						}
-					} else if captchaErr.CaptchaImg != "" {
-						captchaKey, solveErr = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
-						if solveErr != nil {
-							return "", "", "", fmt.Errorf("manual HTTP captcha solve error: %w", solveErr)
+							log.Printf("[STREAM %d] [Captcha] Auto solve failed: %v", streamID, solveErr)
 						}
 					} else {
-						return "", "", "", fmt.Errorf("cannot solve captcha manually: no redirect_uri or captcha_img")
+						solveErr = fmt.Errorf("missing fields for auto solve")
 					}
+				} else if attempt == maxAutoAttempts {
+					// Manual Solve Fallback with 60s Timeout
+					log.Printf("[STREAM %d] [Captcha] Auto failed %d times. Triggering MANUAL fallback...", streamID, maxAutoAttempts)
+
+					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
+
+					type manualRes struct {
+						token string
+						key   string
+						err   error
+					}
+					resCh := make(chan manualRes, 1)
+
+					go func() {
+						var t, k string
+						var e error
+						if captchaErr.RedirectUri != "" {
+							t, e = solveCaptchaViaProxy(captchaErr.RedirectUri, dialer)
+						} else if captchaErr.CaptchaImg != "" {
+							k, e = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
+						} else {
+							e = fmt.Errorf("no redirect_uri or captcha_img")
+						}
+						resCh <- manualRes{t, k, e}
+					}()
+
+					select {
+					case res := <-resCh:
+						successToken = res.token
+						captchaKey = res.key
+						solveErr = res.err
+					case <-manualCtx.Done():
+						solveErr = fmt.Errorf("manual captcha timed out after 60s")
+					}
+					manualCancel()
+				} else {
+					solveErr = fmt.Errorf("max attempts reached")
+				}
+
+				// If solving failed (auto or manual) or timed out
+				if solveErr != nil {
+					log.Printf("[STREAM %d] [Captcha] Failed to solve (attempt %d): %v", streamID, attempt+1, solveErr)
+
+					if attempt < maxAutoAttempts-1 {
+						log.Printf("[STREAM %d] [Captcha] Backing off for 10 seconds before next auto attempt...", streamID)
+						select {
+						case <-ctx.Done():
+							return "", "", "", ctx.Err()
+						case <-time.After(10 * time.Second):
+						}
+						continue
+					} else if attempt == maxAutoAttempts-1 {
+						log.Printf("[STREAM %d] [Captcha] Backing off for 30 seconds before manual fallback...", streamID)
+						select {
+						case <-ctx.Done():
+							return "", "", "", ctx.Err()
+						case <-time.After(30 * time.Second):
+						}
+						continue
+					}
+
+					// Engage global lockout to protect API
+					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
+
+					// If we have 0 streams alive, this is fatal
+					if connectedStreams.Load() == 0 {
+						log.Printf("[STREAM %d] [FATAL] 0 connected streams and manual captcha failed/timed out.", streamID)
+						return "", "", "", fmt.Errorf("FATAL_CAPTCHA_FAILED_NO_STREAMS")
+					}
+
+					return "", "", "", fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
 				}
 
 				if captchaErr.CaptchaAttempt == "0" || captchaErr.CaptchaAttempt == "" {
@@ -839,7 +920,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	clean := strings.Split(urlStr, "?")[0]
 	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
 
-	vkDelayRandom(4000, 5000) // HAR: Final matching delay
+	vkDelayRandom(4000, 5000)
 
 	return user, pass, address, nil
 }
@@ -1398,7 +1479,11 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		err = fmt.Errorf("failed to allocate: %s", err1)
 		return
 	}
+
+	// Safely track active streams globally
+	connectedStreams.Add(1)
 	defer func() {
+		connectedStreams.Add(-1)
 		if err1 := relayConn.Close(); err1 != nil {
 			err = fmt.Errorf("failed to close TURN allocated connection: %s", err1)
 		}
@@ -1495,6 +1580,10 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 			c := make(chan error)
 			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
 			if err := <-c; err != nil {
+				// Suppress DTLS handshake timeout logs while a captcha lockout is active
+				if time.Now().Unix() < globalCaptchaLockout.Load() && strings.Contains(err.Error(), "context deadline exceeded") {
+					continue
+				}
 				log.Printf("%s", err)
 			}
 		}
@@ -1514,8 +1603,41 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			}
 			c := make(chan error)
 			go oneTurnConnection(ctx, turnParams, peer, conn2, streamID, c)
+
 			if err := <-c; err != nil {
-				log.Printf("[STREAM %d] %s", streamID, err)
+				if strings.Contains(err.Error(), "FATAL_CAPTCHA") {
+					log.Printf("[STREAM %d] Fatal manual captcha error. Shutting down application.", streamID)
+					if globalAppCancel != nil {
+						globalAppCancel()
+					}
+					return
+				}
+				if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") {
+					// Only log the backoff message once (the stream that triggered it)
+					// For subsequently awoken streams: calculate exact remaining sleep duration and sleep silently
+					if !strings.Contains(err.Error(), "global lockout active") {
+						log.Printf("[STREAM %d] !!! VK DEMANDS SLIDER CAPTCHA. Backing off for 60 seconds to avoid IP ban...", streamID)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(60 * time.Second):
+						}
+					} else {
+						lockoutEnd := globalCaptchaLockout.Load()
+						sleepDuration := time.Until(time.Unix(lockoutEnd, 0))
+						if sleepDuration < 0 {
+							sleepDuration = 5 * time.Second
+						}
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(sleepDuration):
+						}
+					}
+				} else {
+					log.Printf("[STREAM %d] %s", streamID, err)
+					time.Sleep(2 * time.Second)
+				}
 			}
 		}
 	}
@@ -1523,6 +1645,7 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
+	globalAppCancel = cancel
 	defer cancel()
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
