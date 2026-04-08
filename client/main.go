@@ -65,6 +65,7 @@ var (
 	globalAppCancel      context.CancelFunc
 	handshakeSem         = make(chan struct{}, 3)
 	isDebug              bool
+	manualCaptcha        bool
 )
 
 type UDPPacket struct {
@@ -815,7 +816,10 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	urlAddr := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=%s", creds.ClientID)
 
 	var token2 string
-	const maxAutoAttempts = 2
+	maxAutoAttempts := 2
+	if manualCaptcha {
+		maxAutoAttempts = 0
+	}
 	for attempt := 0; attempt <= maxAutoAttempts+1; attempt++ {
 		resp, err = doRequest(data, urlAddr)
 		if err != nil {
@@ -891,11 +895,11 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						}
 						continue
 					} else if attempt == maxAutoAttempts-1 {
-						log.Printf("[STREAM %d] [Captcha] Backing off for 30 seconds before manual fallback...", streamID)
+						log.Printf("[STREAM %d] [Captcha] Backing off for 2 seconds before manual fallback...", streamID)
 						select {
 						case <-ctx.Done():
 							return "", "", "", ctx.Err()
-						case <-time.After(30 * time.Second):
+						case <-time.After(2 * time.Second):
 						}
 						continue
 					}
@@ -1674,6 +1678,7 @@ func main() {
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
+	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	flag.Parse()
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -1687,6 +1692,7 @@ func main() {
 	}
 
 	isDebug = *debugFlag
+	manualCaptcha = *manualCaptchaFlag
 
 	var link string
 	var getCreds getCredsFunc
