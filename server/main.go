@@ -17,6 +17,8 @@ import (
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
 
+const idleTimeout = 2 * time.Minute
+
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
@@ -150,7 +152,7 @@ func main() {
 						return
 					default:
 					}
-					if err1 := conn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+					if err1 := conn.SetReadDeadline(time.Now().Add(idleTimeout)); err1 != nil {
 						log.Printf("Failed: %s", err1)
 						return
 					}
@@ -160,7 +162,7 @@ func main() {
 						return
 					}
 
-					if err1 := serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+					if err1 := serverConn.SetWriteDeadline(time.Now().Add(idleTimeout)); err1 != nil {
 						log.Printf("Failed: %s", err1)
 						return
 					}
@@ -181,7 +183,7 @@ func main() {
 						return
 					default:
 					}
-					if err1 := serverConn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+					if err1 := serverConn.SetReadDeadline(time.Now().Add(idleTimeout)); err1 != nil {
 						log.Printf("Failed: %s", err1)
 						return
 					}
@@ -191,7 +193,7 @@ func main() {
 						return
 					}
 
-					if err1 := conn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+					if err1 := conn.SetWriteDeadline(time.Now().Add(idleTimeout)); err1 != nil {
 						log.Printf("Failed: %s", err1)
 						return
 					}
