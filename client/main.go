@@ -37,6 +37,8 @@ import (
 
 	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/cacggghp/vk-turn-proxy/internal/cliutil"
+	"github.com/cacggghp/vk-turn-proxy/internal/namegen"
+	"github.com/cacggghp/vk-turn-proxy/internal/telemost"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
@@ -94,6 +96,7 @@ type clientOptions struct {
 	udp           bool
 	direct        bool
 	vlessMode     bool
+	telemostDC    bool
 	debug         bool
 	manualCaptcha bool
 }
@@ -113,13 +116,16 @@ func newClientFlagSet(program string, output io.Writer) (*flag.FlagSet, *clientO
 	fs.BoolVar(&opts.udp, "udp", false, "connect to TURN with UDP")
 	fs.BoolVar(&opts.direct, "no-dtls", false, "connect without obfuscation. DO NOT USE")
 	fs.BoolVar(&opts.vlessMode, "vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
+	fs.BoolVar(&opts.telemostDC, "telemost-dc", false, "use Yandex Telemost DataChannel instead of TURN")
+	fs.BoolVar(&opts.telemostDC, "telemost-datachannel", false, "use Yandex Telemost DataChannel instead of TURN")
 	fs.BoolVar(&opts.debug, "debug", false, "enable debug logging")
 	fs.BoolVar(&opts.manualCaptcha, "manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	fs.Usage = func() {
 		cliutil.Fprintf(fs.Output(), "Usage:\n  %s -peer <host:port> -vk-link <link> [flags]\n  %s -peer <host:port> -yandex-link <link> [flags]\n\n", program, program)
 		cliutil.Fprintln(fs.Output(), "Examples:")
 		cliutil.Fprintf(fs.Output(), "  %s -listen 127.0.0.1:9000 -peer 203.0.113.10:56000 -vk-link https://vk.com/call/join/...\n", program)
-		cliutil.Fprintf(fs.Output(), "  %s -udp -turn 5.255.211.241 -peer 203.0.113.10:56000 -yandex-link https://telemost.yandex.ru/j/... -listen 127.0.0.1:9000\n\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -udp -turn 5.255.211.241 -peer 203.0.113.10:56000 -yandex-link https://telemost.yandex.ru/j/... -listen 127.0.0.1:9000\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc\n\n", program)
 		cliutil.Fprintln(fs.Output(), "Flags:")
 		fs.PrintDefaults()
 	}
@@ -129,14 +135,34 @@ func newClientFlagSet(program string, output io.Writer) (*flag.FlagSet, *clientO
 
 func parseClientOptions(args []string, program string, stdout, stderr io.Writer) (clientOptions, int) {
 	return cliutil.Parse(args, program, stdout, stderr, newClientFlagSet, func(opts *clientOptions) error {
-		if opts.peerAddr == "" {
+		if !opts.telemostDC && opts.peerAddr == "" {
 			return fmt.Errorf("-peer is required")
 		}
 		if (opts.vklink == "") == (opts.yalink == "") {
 			return fmt.Errorf("exactly one of -vk-link or -yandex-link is required")
 		}
+		if opts.telemostDC {
+			if opts.yalink == "" {
+				return fmt.Errorf("-telemost-dc requires -yandex-link")
+			}
+		}
 		return nil
 	})
+}
+
+func runSelectedTelemostDataChannelMode(ctx context.Context, inviteLink, listenAddr string, vlessMode bool) error {
+	if vlessMode {
+		return runTelemostDataChannelVLESSMode(ctx, inviteLink, listenAddr)
+	}
+
+	return runTelemostDataChannelMode(ctx, inviteLink, listenAddr)
+}
+
+func closeOnContextDone(ctx context.Context, closer io.Closer) {
+	go func() {
+		<-ctx.Done()
+		_ = closer.Close()
+	}()
 }
 
 func captchaSolveModeForAttempt(attempt int, manualOnly bool, enableSliderPOC bool) (captchaSolveMode, bool) {
@@ -1026,7 +1052,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		return "", "", "", fmt.Errorf("failed to initialize tls_client: %w", err)
 	}
 
-	name := generateName()
+	name := namegen.Generate()
 	escapedName := neturl.QueryEscape(name)
 
 	log.Printf("[STREAM %d] [VK Auth] Connecting Identity - Name: %s | User-Agent: %s", streamID, name, profile.UserAgent)
@@ -1273,12 +1299,31 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 // endregion
 
-func getYandexCreds(link string) (string, string, string, error) {
+func getYandexCreds(roomInput string) (string, string, string, error) {
+	target, err := telemost.ParseRoomTarget(roomInput)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	var errs []string
+	for _, roomURL := range target.CandidateRoomURLs() {
+		user, pass, addr, err := getYandexCredsForRoomURL(roomURL)
+		if err == nil {
+			return user, pass, addr, nil
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v", roomURL, err))
+	}
+
+	return "", "", "", fmt.Errorf("failed to get yandex turn credentials for room %s: %s", target.RoomID, strings.Join(errs, "; "))
+}
+
+func getYandexCredsForRoomURL(roomURL string) (string, string, string, error) {
 	const telemostConfHost = "cloud-api.yandex.ru"
-	telemostConfPath := fmt.Sprintf("%s%s%s", "/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F", link, "/connection?next_gen_media_platform_allowed=false")
+	telemostConfPath := fmt.Sprintf("%s%s%s", "/telemost_front/v2/telemost/conferences/", neturl.QueryEscape(roomURL), "/connection?next_gen_media_platform_allowed=false")
 
 	profile := getRandomProfile()
-	name := generateName()
+	name := namegen.Generate()
+	origin := telemost.WebOriginFromRoomURL(roomURL)
 
 	type ConferenceResponse struct {
 		URI                 string `json:"uri"`
@@ -1409,8 +1454,8 @@ func getYandexCreds(link string) (string, string, string, error) {
 
 	applyBrowserProfile(req, profile)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", "https://telemost.yandex.ru/")
-	req.Header.Set("Origin", "https://telemost.yandex.ru")
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("Origin", origin)
 	req.Header.Set("Client-Instance-Id", uuid.New().String())
 
 	resp, err := client.Do(req)
@@ -1441,7 +1486,8 @@ func getYandexCreds(link string) (string, string, string, error) {
 		Wss:           result.ClientConfiguration.MediaServerURL,
 	}
 	h := http.Header{}
-	h.Set("Origin", "https://telemost.yandex.ru")
+	h.Set("Origin", origin)
+	h.Set("Referer", origin+"/")
 	h.Set("User-Agent", profile.UserAgent)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -2006,14 +2052,22 @@ func main() {
 		log.Fatalf("Exit...\n")
 	}()
 
-	peer, err := net.ResolveUDPAddr("udp", opts.peerAddr)
-	if err != nil {
-		panic(err)
-	}
-
 	isDebug = opts.debug
+	telemost.SetDebug(opts.debug)
 	manualCaptcha = opts.manualCaptcha
 	autoCaptchaSliderPOC = !manualCaptcha
+
+	if opts.telemostDC {
+		if err := runSelectedTelemostDataChannelMode(ctx, opts.yalink, opts.listen, opts.vlessMode); err != nil {
+			log.Fatalf("Telemost DataChannel mode failed: %v", err)
+		}
+		return
+	}
+
+	peer, err := net.ResolveUDPAddr("udp", opts.peerAddr)
+	if err != nil {
+		log.Fatalf("invalid peer address %q: %v", opts.peerAddr, err)
+	}
 
 	var link string
 	var getCreds getCredsFunc
@@ -2034,8 +2088,11 @@ func main() {
 			opts.n = 10
 		}
 	} else {
-		parts := strings.Split(opts.yalink, "j/")
-		link = parts[len(parts)-1]
+		target, err := telemost.ParseRoomTarget(opts.yalink)
+		if err != nil {
+			log.Fatalf("invalid yandex-link: %v", err)
+		}
+		link = target.RoomID
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
 			return getYandexCreds(s)
 		}
@@ -2043,8 +2100,10 @@ func main() {
 			opts.n = 1
 		}
 	}
-	if idx := strings.IndexAny(link, "/?#"); idx != -1 {
-		link = link[:idx]
+	if opts.vklink != "" {
+		if idx := strings.IndexAny(link, "/?#"); idx != -1 {
+			link = link[:idx]
+		}
 	}
 
 	params := &turnParams{
@@ -2447,7 +2506,11 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		cleanup()
 		return nil, nil, fmt.Errorf("KCP session: %w", err)
 	}
-	cleanupFns = append(cleanupFns, func() { _ = cleanupKCP() })
+	cleanupFns = append(cleanupFns, func() {
+		if cleanupErr := cleanupKCP(); cleanupErr != nil {
+			log.Printf("failed to close KCP-over-DTLS transport: %v", cleanupErr)
+		}
+	})
 	log.Printf("KCP session established")
 
 	// 6. Create smux client session over KCP

@@ -68,7 +68,7 @@ func TestParseServerOptionsParsesValidArgs(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	opts, exitCode := parseServerOptions([]string{"-connect", "127.0.0.1:51820", "-listen", "0.0.0.0:56000", "-vless"}, "server", &stdout, &stderr)
+	opts, exitCode := parseServerOptions([]string{"-connect", "127.0.0.1:51820", "-listen", "0.0.0.0:56000", "-vless", "-debug"}, "server", &stdout, &stderr)
 	if exitCode != cliutil.ContinueExecution {
 		t.Fatalf("parseServerOptions() exitCode = %d, want %d", exitCode, cliutil.ContinueExecution)
 	}
@@ -83,5 +83,74 @@ func TestParseServerOptionsParsesValidArgs(t *testing.T) {
 	}
 	if !opts.vlessMode {
 		t.Fatal("vlessMode = false, want true")
+	}
+	if !opts.debug {
+		t.Fatal("debug = false, want true")
+	}
+}
+
+func TestParseServerOptionsParsesTelemostDataChannelArgs(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	opts, exitCode := parseServerOptions([]string{
+		"-connect", "127.0.0.1:51820",
+		"-yandex-link", "https://telemost.yandex.ru/j/test",
+		"-telemost-dc",
+	}, "server", &stdout, &stderr)
+	if exitCode != cliutil.ContinueExecution {
+		t.Fatalf("parseServerOptions() exitCode = %d, want %d", exitCode, cliutil.ContinueExecution)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
+	}
+	if !opts.telemostDC {
+		t.Fatal("telemostDC = false, want true")
+	}
+	if opts.yalink == "" {
+		t.Fatal("yalink = empty, want yandex link")
+	}
+}
+
+func TestParseServerOptionsRejectsTelemostDataChannelWithoutYandexLink(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	_, exitCode := parseServerOptions([]string{
+		"-connect", "127.0.0.1:51820",
+		"-telemost-dc",
+	}, "server", &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("parseServerOptions() exitCode = %d, want 2", exitCode)
+	}
+	if got := stderr.String(); !strings.Contains(got, "-telemost-dc requires -yandex-link") {
+		t.Fatalf("expected telemost-dc validation error, got %q", got)
+	}
+}
+
+func TestParseServerOptionsAllowsTelemostDataChannelWithVLESS(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	opts, exitCode := parseServerOptions([]string{
+		"-connect", "127.0.0.1:51820",
+		"-yandex-link", "https://telemost.yandex.ru/j/test",
+		"-telemost-dc",
+		"-vless",
+	}, "server", &stdout, &stderr)
+	if exitCode != cliutil.ContinueExecution {
+		t.Fatalf("parseServerOptions() exitCode = %d, want %d", exitCode, cliutil.ContinueExecution)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
+	}
+	if !opts.telemostDC || !opts.vlessMode {
+		t.Fatalf("expected telemostDC and vlessMode to be true, got telemostDC=%v vlessMode=%v", opts.telemostDC, opts.vlessMode)
 	}
 }
