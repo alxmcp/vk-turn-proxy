@@ -1,32 +1,74 @@
 # Good TURN
 
-Проброс трафика WireGuard/Hysteria через TURN сервера VK звонков или ~~Яндекс телемоста~~. Пакеты шифруются DTLS 1.2, затем параллельными потоками через TCP или UDP отправляются на TURN сервер по протоколу STUN ChannelData. Оттуда по UDP отправляются на ваш сервер, где расшифровываются и передаются в WireGuard. Логин/пароль от TURN генерируются из ссылки на звонок.
+Проброс трафика WireGuard/Hysteria/VLESS через TURN сервера VK звонков или ~~Яндекс Телемоста~~, или через DC Яндекс Телемоста. Пакеты шифруются DTLS 1.2, затем параллельными потоками через TCP или UDP отправляются на TURN сервер по протоколу STUN ChannelData. Оттуда по UDP отправляются на ваш сервер, где расшифровываются и передаются в WireGuard. Логин/пароль от TURN генерируются из ссылки на звонок.
 
 Только для учебных целей!
+
+## Содержание
+
+- [Good TURN](#good-turn)
+  - [Режимы работы](#режимы-работы)
+  - [Похожие проекты](#похожие-проекты)
+    - [Server & Cli](#server--cli)
+    - [Android](#android)
+    - [iOS](#ios)
+    - [macOS](#macos)
+  - [Настройка](#настройка)
+    - [Сервер](#сервер)
+      - [Установка демона](#установка-демона)
+      - [Docker](#docker)
+    - [Клиент](#клиент)
+      - [Android](#android-1)
+      - [iOS](#ios-1)
+      - [Linux](#linux)
+      - [macOS](#macos-1)
+      - [Windows](#windows)
+    - [Если не работает](#если-не-работает)
+  - [Яндекс Телемост](#яндекс-телемост)
+  - [v2ray](#v2ray)
+  - [VLESS-режим](#vless-режим)
+    - [Настройка](#настройка-1)
+    - [Сервер (VPS)](#сервер-vps)
+      - [Docker](#docker-1)
+    - [Клиент](#клиент-1)
+  - [Telemost DataChannel](#telemost-datachannel)
+    - [Сервер](#сервер-1)
+    - [Клиент](#клиент-2)
+    - [VLESS через Telemost DataChannel](#vless-через-telemost-datachannel)
+  - [Direct mode](#direct-mode)
+
+## Режимы работы
+
+| Режим                                         | Клиент                          | Сервер                          | Полезная нагрузка      | Транспорт                                                                    |
+|-----------------------------------------------|---------------------------------|---------------------------------|------------------------|------------------------------------------------------------------------------|
+| VK TURN                                       | `-vk-link ...`                  | `-connect ...`                  | UDP-пакеты WireGuard   | TURN поверх TCP по умолчанию, либо UDP с `-udp`                              |
+| Telemost TURN _(не работает)_                 | `-yandex-link ...`              | `-connect ...`                  | UDP-пакеты WireGuard   | TURN поверх TCP по умолчанию, либо UDP с `-udp`; `-n` по умолчанию `1`       |
+| [VLESS](#vless-режим)                         | `-vless`                        | `-vless`                        | TCP-потоки             | TURN поверх TCP по умолчанию, либо UDP с `-udp`, дальше `DTLS -> KCP + smux` |
+| [Telemost DataChannel](#telemost-datachannel) | `-telemost-dc -yandex-link ...` | `-telemost-dc -yandex-link ...` | UDP или TCP (`-vless`) | WebRTC DataChannel, без TURN                                                 |
 
 ## Похожие проекты
 
 > [!WARNING]  
 > Авторы данного репозитория не несут ответственности за другие похожие проекты.
 
-#### Server
+### Server & Cli
 - https://github.com/Urtyom-Alyanov/turn-proxy - реализация на Rust
 - https://github.com/jaykaiperson/lionheart - аналог для https://stream.wb.ru (статья: https://habr.com/ru/articles/1017410/)
 - https://github.com/kulikov0/whitelist-bypass - проброс через медиасервер SFU ВК и Яндекс Телемоста
 - https://github.com/NedgNDG/vk-proxy-auto-installer - автоустановщик VK TURN Proxy (TUI)
 
-#### Android
+### Android
 - https://github.com/MYSOREZ/vk-turn-proxy-android - клиент для андроида
 - https://github.com/WINGS-N/WINGSV - клиент для андроида с One UI, WireGuard, раздачей VPN с root
 - https://github.com/kiper292/wireguard-turn-android - клиент для андроида интегрированный в WireGuard
 - https://github.com/oxsidee/vkpn - клиент для андроида (кроссплатформенный Flutter)
-- https://github.com/antongospod/turn-proxy-android - клиент для андроида c Material 3 UI и автоапдейтами (Kotlin)
+- https://github.com/samosvalishe/turn-proxy-android - клиент для андроида c Material 3 UI и автоапдейтами (Kotlin)
 - https://github.com/amurcanov/proxy-turn-vk-android - клиент для андроида с WireGuard
 
-#### iOS
+### iOS
 - https://github.com/nullcstring/turnbridge - клиент для iOS
 
-#### macOS
+### macOS
 - https://github.com/denny4-user/vk-turn-proxy-macos-gui - клиент для macOS
 
 
@@ -299,15 +341,15 @@ curl -L -o client https://github.com/cacggghp/vk-turn-proxy/releases/latest/down
 
 По умолчанию капча теперь проходит так: обычная автопопытка, затем автопопытка через пазл-слайдер POC, и только потом ручной режим.
 
-## Яндекс телемост
+## Яндекс Телемост
 
-**UPD. ТЕЛЕМОСТ ЗАКРЫЛИ**
+**UPD: Не работает.**
 
 В отличие от ВК, сервера яндекса не ограничивают скорость, так что по умолчанию стоит `-n 1`. Увеличение этого числа может привести к временной блокировке по IP из-за переполнения конференции фейковыми участниками.
 
-В режиме `-udp` скорость обычно больше
+В режиме `-udp` скорость обычно больше.
 
-Большинство диапазонов IP TURN серверов Яндекса не работают, указывайте вручную через `-turn`
+Большинство диапазонов IP TURN серверов Яндекса не работают, указывайте вручную через `-turn`.
 
 <details>
     <summary>
@@ -534,8 +576,43 @@ Xray сервер (config.json)
 
 </details>
 
+## Telemost DataChannel
+
+Для Яндекс Телемоста теперь есть альтернативный режим без TURN: `-telemost-dc`.
+
+Режим работает как для обычного UDP/WireGuard-сценария, так и для `-vless`.
+
+### Сервер
+
+```
+./server -connect 127.0.0.1:51820 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc
+```
+
+### Клиент
+
+```
+./client -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc
+```
+
+В этом режиме флаг `-peer` не нужен: клиент и сервер встречаются внутри одной конференции Telemost по одной и той же ссылке.
+
+### VLESS через Telemost DataChannel
+
+Сервер:
+
+```
+./server -connect 127.0.0.1:443 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc -vless
+```
+
+Клиент:
+
+```
+./client -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc -vless
+```
+
 
 ## Direct mode
 
-С флагом `-no-dtls` можно отправлять пакеты без обфускации DTLS и подключаться к обычным серверам Wireguard. Может привести к бану от вк/яндекса.
+**UPD: Не работает.**
 
+С флагом `-no-dtls` можно отправлять пакеты без обфускации DTLS и подключаться к обычным серверам Wireguard. Может привести к бану от вк/яндекса.

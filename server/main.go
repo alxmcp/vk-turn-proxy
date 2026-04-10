@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cacggghp/vk-turn-proxy/internal/cliutil"
+	"github.com/cacggghp/vk-turn-proxy/internal/telemost"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
@@ -23,9 +24,12 @@ import (
 )
 
 type serverOptions struct {
-	listen    string
-	connect   string
-	vlessMode bool
+	listen     string
+	connect    string
+	yalink     string
+	vlessMode  bool
+	telemostDC bool
+	debug      bool
 }
 
 func newServerFlagSet(program string, output io.Writer) (*flag.FlagSet, *serverOptions) {
@@ -35,12 +39,17 @@ func newServerFlagSet(program string, output io.Writer) (*flag.FlagSet, *serverO
 	opts := &serverOptions{}
 	fs.StringVar(&opts.listen, "listen", "0.0.0.0:56000", "listen on ip:port")
 	fs.StringVar(&opts.connect, "connect", "", "connect to ip:port")
+	fs.StringVar(&opts.yalink, "yandex-link", "", "Yandex Telemost invite link \"https://telemost.yandex.ru/j/...\"")
 	fs.BoolVar(&opts.vlessMode, "vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
+	fs.BoolVar(&opts.telemostDC, "telemost-dc", false, "use Yandex Telemost DataChannel instead of DTLS listener")
+	fs.BoolVar(&opts.telemostDC, "telemost-datachannel", false, "use Yandex Telemost DataChannel instead of DTLS listener")
+	fs.BoolVar(&opts.debug, "debug", false, "enable debug logging")
 	fs.Usage = func() {
 		cliutil.Fprintf(fs.Output(), "Usage:\n  %s -connect <ip:port> [flags]\n\n", program)
 		cliutil.Fprintln(fs.Output(), "Examples:")
 		cliutil.Fprintf(fs.Output(), "  %s -connect 127.0.0.1:51820\n", program)
-		cliutil.Fprintf(fs.Output(), "  %s -listen 0.0.0.0:56000 -connect 127.0.0.1:51820 -vless\n\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -listen 0.0.0.0:56000 -connect 127.0.0.1:51820 -vless\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -connect 127.0.0.1:51820 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc\n\n", program)
 		cliutil.Fprintln(fs.Output(), "Flags:")
 		fs.PrintDefaults()
 	}
@@ -53,8 +62,28 @@ func parseServerOptions(args []string, program string, stdout, stderr io.Writer)
 		if opts.connect == "" {
 			return fmt.Errorf("-connect is required")
 		}
+		if opts.telemostDC {
+			if opts.yalink == "" {
+				return fmt.Errorf("-telemost-dc requires -yandex-link")
+			}
+		}
 		return nil
 	})
+}
+
+func runSelectedTelemostDataChannelMode(ctx context.Context, inviteLink, connectAddr string, vlessMode bool) error {
+	if vlessMode {
+		return runTelemostDataChannelVLESSMode(ctx, inviteLink, connectAddr)
+	}
+
+	return runTelemostDataChannelMode(ctx, inviteLink, connectAddr)
+}
+
+func closeOnContextDone(ctx context.Context, closer io.Closer) {
+	go func() {
+		<-ctx.Done()
+		_ = closer.Close()
+	}()
 }
 
 func main() {
@@ -75,31 +104,41 @@ func main() {
 		log.Fatalf("Exit...\n")
 	}()
 
-	addr, err := net.ResolveUDPAddr("udp", opts.listen)
-	if err != nil {
-		panic(err)
+	telemost.SetDebug(opts.debug)
+
+	if opts.telemostDC {
+		if err := runSelectedTelemostDataChannelMode(ctx, opts.yalink, opts.connect, opts.vlessMode); err != nil {
+			log.Fatalf("Telemost DataChannel mode failed: %v", err)
+		}
+		return
 	}
+
+	listenAddr, err := net.ResolveUDPAddr("udp", opts.listen)
+	if err != nil {
+		log.Fatalf("invalid listen address %q: %v", opts.listen, err)
+	}
+
 	// Generate a certificate and private key to secure the connection
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
-		panic(genErr)
+		log.Fatalf("failed to generate DTLS certificate: %v", genErr)
 	}
 
 	// Connect to a DTLS server
 	listener, err := dtls.ListenWithOptions(
 		"udp",
-		addr,
+		listenAddr,
 		dtls.WithCertificates(certificate),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
 		dtls.WithCipherSuites(dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
 		dtls.WithConnectionIDGenerator(dtls.RandomCIDGenerator(8)),
 	)
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to start DTLS listener on %s: %v", opts.listen, err)
 	}
 	context.AfterFunc(ctx, func() {
-		if err = listener.Close(); err != nil {
-			panic(err)
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			log.Printf("failed to close DTLS listener: %v", closeErr)
 		}
 	})
 

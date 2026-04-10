@@ -1,4 +1,4 @@
-package main
+package namegen
 
 import (
 	"fmt"
@@ -162,26 +162,25 @@ func convertToFemaleSurname(surname string) string {
 	return surname
 }
 
-func generateName() string {
-	// Decide gender first
+func Generate() string {
 	isFemale := rand.Intn(2) == 0
 
-	var fn string
+	var firstName string
 	if isFemale {
-		fn = femaleFirstNames[rand.Intn(len(femaleFirstNames))]
+		firstName = femaleFirstNames[rand.Intn(len(femaleFirstNames))]
 	} else {
-		fn = maleFirstNames[rand.Intn(len(maleFirstNames))]
+		firstName = maleFirstNames[rand.Intn(len(maleFirstNames))]
 	}
 
 	// 70% chance to have a last name
 	if rand.Float32() < 0.3 {
-		return fn
+		return firstName
 	}
 
-	ln := lastNames[rand.Intn(len(lastNames))]
+	lastName := lastNames[rand.Intn(len(lastNames))]
 	if isFemale {
-		ln = convertToFemaleSurname(ln)
+		lastName = convertToFemaleSurname(lastName)
 	}
 
-	return fmt.Sprintf("%s %s", fn, ln)
+	return fmt.Sprintf("%s %s", firstName, lastName)
 }

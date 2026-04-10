@@ -91,6 +91,71 @@ func TestParseClientOptionsParsesValidVKArgs(t *testing.T) {
 	}
 }
 
+func TestParseClientOptionsParsesTelemostDataChannelArgs(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	opts, exitCode := parseClientOptions([]string{
+		"-yandex-link", "https://telemost.yandex.ru/j/test",
+		"-listen", "127.0.0.1:9002",
+		"-telemost-dc",
+	}, "client", &stdout, &stderr)
+	if exitCode != cliutil.ContinueExecution {
+		t.Fatalf("parseClientOptions() exitCode = %d, want %d", exitCode, cliutil.ContinueExecution)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
+	}
+	if !opts.telemostDC {
+		t.Fatal("telemostDC = false, want true")
+	}
+	if opts.peerAddr != "" {
+		t.Fatalf("peerAddr = %q, want empty for telemost-dc mode", opts.peerAddr)
+	}
+}
+
+func TestParseClientOptionsRejectsTelemostDataChannelWithoutYandexLink(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	_, exitCode := parseClientOptions([]string{
+		"-vk-link", "https://vk.com/call/join/test",
+		"-telemost-dc",
+	}, "client", &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("parseClientOptions() exitCode = %d, want 2", exitCode)
+	}
+	if got := stderr.String(); !strings.Contains(got, "-telemost-dc requires -yandex-link") {
+		t.Fatalf("expected telemost-dc validation error, got %q", got)
+	}
+}
+
+func TestParseClientOptionsAllowsTelemostDataChannelWithVLESS(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	opts, exitCode := parseClientOptions([]string{
+		"-yandex-link", "https://telemost.yandex.ru/j/test",
+		"-telemost-dc",
+		"-vless",
+	}, "client", &stdout, &stderr)
+	if exitCode != cliutil.ContinueExecution {
+		t.Fatalf("parseClientOptions() exitCode = %d, want %d", exitCode, cliutil.ContinueExecution)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
+	}
+	if !opts.telemostDC || !opts.vlessMode {
+		t.Fatalf("expected telemostDC and vlessMode to be true, got telemostDC=%v vlessMode=%v", opts.telemostDC, opts.vlessMode)
+	}
+}
+
 func TestCaptchaSolveModeForAttempt(t *testing.T) {
 	t.Parallel()
 
