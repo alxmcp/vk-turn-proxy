@@ -585,8 +585,10 @@ Xray сервер (config.json)
 ### Сервер
 
 ```
-./server -connect 127.0.0.1:51820 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc
+./server -connect 127.0.0.1:<порт WG> -yandex-link https://telemost.yandex.ru/j/... -telemost-dc
 ```
+
+Вместо ссылки можно использовать просто ID звонка, ссылка может быть `.ru` и `.com`.
 
 ### Клиент
 
@@ -601,7 +603,7 @@ Xray сервер (config.json)
 Сервер:
 
 ```
-./server -connect 127.0.0.1:443 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc -vless
+./server -connect 127.0.0.1:<порт VLESS> -yandex-link https://telemost.yandex.ru/j/... -telemost-dc -vless
 ```
 
 Клиент:
