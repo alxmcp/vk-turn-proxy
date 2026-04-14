@@ -9,10 +9,17 @@ import (
 	"time"
 
 	"github.com/cacggghp/vk-turn-proxy/internal/dcmux"
-	"github.com/cacggghp/vk-turn-proxy/internal/telemost"
 )
 
 func runTelemostDataChannelVLESSMode(ctx context.Context, inviteLink, listenAddr string) error {
+	return runDataChannelVLESSMode(ctx, "Telemost", connectTelemostDataChannelPeer, inviteLink, listenAddr)
+}
+
+func runJazzDataChannelVLESSMode(ctx context.Context, room, listenAddr string) error {
+	return runDataChannelVLESSMode(ctx, "SaluteJazz", connectJazzDataChannelPeer, room, listenAddr)
+}
+
+func runDataChannelVLESSMode(ctx context.Context, providerName string, connectPeer dataChannelConnectFunc, room, listenAddr string) error {
 	var (
 		connMu sync.Mutex
 		conns  = make(map[uint16]net.Conn)
@@ -26,22 +33,20 @@ func runTelemostDataChannelVLESSMode(ctx context.Context, inviteLink, listenAddr
 		}
 	}
 
-	var peer *telemost.Peer
+	var peer dataChannelPeer
 	clientID := uint32(time.Now().UnixNano())
 	mux := dcmux.New(clientID, func(frame []byte) error {
 		return peer.Send(frame)
 	})
-	peer, err := telemost.NewConnectedPeer(ctx, inviteLink, mux.HandleFrame, func() {
-		if telemost.DebugEnabled() {
-			log.Printf("Telemost DataChannel VLESS: peer reconnected, closing active TCP streams")
-		}
+	peer, err := connectPeer(ctx, room, mux.HandleFrame, func() {
+		log.Printf("%s DataChannel VLESS: peer reconnected, closing active TCP streams", providerName)
 		closeAll()
 		mux.Reset()
 	})
 	if err != nil {
 		return err
 	}
-	defer func(peer *telemost.Peer) {
+	defer func(peer dataChannelPeer) {
 		err := peer.Close()
 		if err != nil {
 			log.Println(err)
@@ -60,7 +65,7 @@ func runTelemostDataChannelVLESSMode(ctx context.Context, inviteLink, listenAddr
 	}(listener)
 	closeOnContextDone(ctx, listener)
 
-	log.Printf("Telemost DataChannel VLESS mode: listening on %s", listenAddr)
+	log.Printf("%s DataChannel VLESS mode: listening on %s", providerName, listenAddr)
 
 	for {
 		conn, err := listener.Accept()
@@ -69,7 +74,7 @@ func runTelemostDataChannelVLESSMode(ctx context.Context, inviteLink, listenAddr
 				closeAll()
 				return nil
 			}
-			log.Printf("Telemost DataChannel VLESS accept error: %v", err)
+			log.Printf("%s DataChannel VLESS accept error: %v", providerName, err)
 			continue
 		}
 
@@ -84,7 +89,7 @@ func runTelemostDataChannelVLESSMode(ctx context.Context, inviteLink, listenAddr
 				delete(conns, streamID)
 				connMu.Unlock()
 				if err := mux.CloseStream(streamID); err != nil {
-					log.Printf("Telemost DataChannel VLESS: failed to close mux stream %d: %v", streamID, err)
+					log.Printf("%s DataChannel VLESS: failed to close mux stream %d: %v", providerName, streamID, err)
 				}
 				_ = tcpConn.Close()
 				mux.CleanupStream(streamID)

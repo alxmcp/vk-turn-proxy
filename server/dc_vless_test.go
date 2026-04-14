@@ -16,7 +16,7 @@ func TestEnqueueBackendDataReturnsWhenQueueIsFull(t *testing.T) {
 		_ = serverConn.Close()
 	}()
 
-	stream := newTelemostBackendStream(context.Background(), clientConn)
+	stream := newDCBackendStream(context.Background(), clientConn)
 	defer stream.Close()
 
 	stream.writeCh = make(chan []byte, 1)
@@ -44,7 +44,7 @@ func TestEnqueueBackendDataReturnsCanceledForClosedStream(t *testing.T) {
 		_ = serverConn.Close()
 	}()
 
-	stream := newTelemostBackendStream(context.Background(), clientConn)
+	stream := newDCBackendStream(context.Background(), clientConn)
 	stream.Close()
 
 	err := enqueueBackendData(stream, []byte("next"))
@@ -53,14 +53,14 @@ func TestEnqueueBackendDataReturnsCanceledForClosedStream(t *testing.T) {
 	}
 }
 
-func TestTelemostBackendStreamWriteReturnsNetErrClosedAfterClose(t *testing.T) {
+func TestDCBackendStreamWriteReturnsNetErrClosedAfterClose(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer func() {
 		_ = clientConn.Close()
 		_ = serverConn.Close()
 	}()
 
-	stream := newTelemostBackendStream(context.Background(), clientConn)
+	stream := newDCBackendStream(context.Background(), clientConn)
 	stream.Close()
 
 	err := stream.write([]byte("next"))

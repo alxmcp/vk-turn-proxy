@@ -100,7 +100,7 @@ func TestParseClientOptionsParsesTelemostDataChannelArgs(t *testing.T) {
 	opts, exitCode := parseClientOptions([]string{
 		"-yandex-link", "https://telemost.yandex.ru/j/test",
 		"-listen", "127.0.0.1:9002",
-		"-telemost-dc",
+		"-dc",
 	}, "client", &stdout, &stderr)
 	if exitCode != cliutil.ContinueExecution {
 		t.Fatalf("parseClientOptions() exitCode = %d, want %d", exitCode, cliutil.ContinueExecution)
@@ -108,15 +108,15 @@ func TestParseClientOptionsParsesTelemostDataChannelArgs(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr output, got %q", stderr.String())
 	}
-	if !opts.telemostDC {
-		t.Fatal("telemostDC = false, want true")
+	if !opts.dc {
+		t.Fatal("dc = false, want true")
 	}
 	if opts.peerAddr != "" {
-		t.Fatalf("peerAddr = %q, want empty for telemost-dc mode", opts.peerAddr)
+		t.Fatalf("peerAddr = %q, want empty for dc mode", opts.peerAddr)
 	}
 }
 
-func TestParseClientOptionsRejectsTelemostDataChannelWithoutYandexLink(t *testing.T) {
+func TestParseClientOptionsRejectsDataChannelWithoutDataChannelRoom(t *testing.T) {
 	t.Parallel()
 
 	var stdout bytes.Buffer
@@ -124,13 +124,13 @@ func TestParseClientOptionsRejectsTelemostDataChannelWithoutYandexLink(t *testin
 
 	_, exitCode := parseClientOptions([]string{
 		"-vk-link", "https://vk.com/call/join/test",
-		"-telemost-dc",
+		"-dc",
 	}, "client", &stdout, &stderr)
 	if exitCode != 2 {
 		t.Fatalf("parseClientOptions() exitCode = %d, want 2", exitCode)
 	}
-	if got := stderr.String(); !strings.Contains(got, "-telemost-dc requires -yandex-link") {
-		t.Fatalf("expected telemost-dc validation error, got %q", got)
+	if got := stderr.String(); !strings.Contains(got, "-dc requires -yandex-link or -jazz-room") {
+		t.Fatalf("expected dc validation error, got %q", got)
 	}
 }
 
@@ -142,7 +142,7 @@ func TestParseClientOptionsAllowsTelemostDataChannelWithVLESS(t *testing.T) {
 
 	opts, exitCode := parseClientOptions([]string{
 		"-yandex-link", "https://telemost.yandex.ru/j/test",
-		"-telemost-dc",
+		"-dc",
 		"-vless",
 	}, "client", &stdout, &stderr)
 	if exitCode != cliutil.ContinueExecution {
@@ -151,8 +151,54 @@ func TestParseClientOptionsAllowsTelemostDataChannelWithVLESS(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr output, got %q", stderr.String())
 	}
-	if !opts.telemostDC || !opts.vlessMode {
-		t.Fatalf("expected telemostDC and vlessMode to be true, got telemostDC=%v vlessMode=%v", opts.telemostDC, opts.vlessMode)
+	if !opts.dc || !opts.vlessMode {
+		t.Fatalf("expected dc and vlessMode to be true, got dc=%v vlessMode=%v", opts.dc, opts.vlessMode)
+	}
+}
+
+func TestParseClientOptionsParsesJazzDataChannelArgs(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	opts, exitCode := parseClientOptions([]string{
+		"-jazz-room", "room:password",
+		"-listen", "127.0.0.1:9002",
+		"-dc",
+	}, "client", &stdout, &stderr)
+	if exitCode != cliutil.ContinueExecution {
+		t.Fatalf("parseClientOptions() exitCode = %d, want %d", exitCode, cliutil.ContinueExecution)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr output, got %q", stderr.String())
+	}
+	if !opts.dc {
+		t.Fatal("dc = false, want true")
+	}
+	if opts.jazzRoom != "room:password" {
+		t.Fatalf("jazzRoom = %q, want room:password", opts.jazzRoom)
+	}
+	if opts.peerAddr != "" {
+		t.Fatalf("peerAddr = %q, want empty for dc mode", opts.peerAddr)
+	}
+}
+
+func TestParseClientOptionsRejectsJazzRoomWithoutDataChannel(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	_, exitCode := parseClientOptions([]string{
+		"-peer", "127.0.0.1:56000",
+		"-jazz-room", "room:password",
+	}, "client", &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("parseClientOptions() exitCode = %d, want 2", exitCode)
+	}
+	if got := stderr.String(); !strings.Contains(got, "-jazz-room requires -dc") {
+		t.Fatalf("expected jazz room validation error, got %q", got)
 	}
 }
 

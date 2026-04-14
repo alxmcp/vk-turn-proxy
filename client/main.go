@@ -37,6 +37,7 @@ import (
 
 	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/cacggghp/vk-turn-proxy/internal/cliutil"
+	"github.com/cacggghp/vk-turn-proxy/internal/jazz"
 	"github.com/cacggghp/vk-turn-proxy/internal/namegen"
 	"github.com/cacggghp/vk-turn-proxy/internal/telemost"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
@@ -91,12 +92,13 @@ type clientOptions struct {
 	listen        string
 	vklink        string
 	yalink        string
+	jazzRoom      string
 	peerAddr      string
 	n             int
 	udp           bool
 	direct        bool
 	vlessMode     bool
-	telemostDC    bool
+	dc            bool
 	debug         bool
 	manualCaptcha bool
 }
@@ -111,13 +113,13 @@ func newClientFlagSet(program string, output io.Writer) (*flag.FlagSet, *clientO
 	fs.StringVar(&opts.listen, "listen", "127.0.0.1:9000", "listen on ip:port")
 	fs.StringVar(&opts.vklink, "vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
 	fs.StringVar(&opts.yalink, "yandex-link", "", "Yandex Telemost invite link \"https://telemost.yandex.ru/j/...\"")
+	fs.StringVar(&opts.jazzRoom, "jazz-room", "", "SaluteJazz room \"roomId[:password]\"")
 	fs.StringVar(&opts.peerAddr, "peer", "", "peer server address (host:port)")
 	fs.IntVar(&opts.n, "n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
 	fs.BoolVar(&opts.udp, "udp", false, "connect to TURN with UDP")
 	fs.BoolVar(&opts.direct, "no-dtls", false, "connect without obfuscation. DO NOT USE")
 	fs.BoolVar(&opts.vlessMode, "vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
-	fs.BoolVar(&opts.telemostDC, "telemost-dc", false, "use Yandex Telemost DataChannel instead of TURN")
-	fs.BoolVar(&opts.telemostDC, "telemost-datachannel", false, "use Yandex Telemost DataChannel instead of TURN")
+	fs.BoolVar(&opts.dc, "dc", false, "use WebRTC DataChannel instead of TURN")
 	fs.BoolVar(&opts.debug, "debug", false, "enable debug logging")
 	fs.BoolVar(&opts.manualCaptcha, "manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	fs.Usage = func() {
@@ -125,7 +127,8 @@ func newClientFlagSet(program string, output io.Writer) (*flag.FlagSet, *clientO
 		cliutil.Fprintln(fs.Output(), "Examples:")
 		cliutil.Fprintf(fs.Output(), "  %s -listen 127.0.0.1:9000 -peer 203.0.113.10:56000 -vk-link https://vk.com/call/join/...\n", program)
 		cliutil.Fprintf(fs.Output(), "  %s -udp -turn 5.255.211.241 -peer 203.0.113.10:56000 -yandex-link https://telemost.yandex.ru/j/... -listen 127.0.0.1:9000\n", program)
-		cliutil.Fprintf(fs.Output(), "  %s -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc\n\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -dc\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -listen 127.0.0.1:9000 -jazz-room room:password -dc\n\n", program)
 		cliutil.Fprintln(fs.Output(), "Flags:")
 		fs.PrintDefaults()
 	}
@@ -135,16 +138,23 @@ func newClientFlagSet(program string, output io.Writer) (*flag.FlagSet, *clientO
 
 func parseClientOptions(args []string, program string, stdout, stderr io.Writer) (clientOptions, int) {
 	return cliutil.Parse(args, program, stdout, stderr, newClientFlagSet, func(opts *clientOptions) error {
-		if !opts.telemostDC && opts.peerAddr == "" {
+		if !opts.dc && opts.peerAddr == "" {
 			return fmt.Errorf("-peer is required")
 		}
-		if (opts.vklink == "") == (opts.yalink == "") {
-			return fmt.Errorf("exactly one of -vk-link or -yandex-link is required")
-		}
-		if opts.telemostDC {
-			if opts.yalink == "" {
-				return fmt.Errorf("-telemost-dc requires -yandex-link")
+		linkCount := 0
+		for _, link := range []string{opts.vklink, opts.yalink, opts.jazzRoom} {
+			if link != "" {
+				linkCount++
 			}
+		}
+		if linkCount != 1 {
+			return fmt.Errorf("exactly one of -vk-link, -yandex-link, or -jazz-room is required")
+		}
+		if opts.jazzRoom != "" && !opts.dc {
+			return fmt.Errorf("-jazz-room requires -dc")
+		}
+		if opts.dc && opts.yalink == "" && opts.jazzRoom == "" {
+			return fmt.Errorf("-dc requires -yandex-link or -jazz-room")
 		}
 		return nil
 	})
@@ -156,6 +166,14 @@ func runSelectedTelemostDataChannelMode(ctx context.Context, inviteLink, listenA
 	}
 
 	return runTelemostDataChannelMode(ctx, inviteLink, listenAddr)
+}
+
+func runSelectedJazzDataChannelMode(ctx context.Context, room, listenAddr string, vlessMode bool) error {
+	if vlessMode {
+		return runJazzDataChannelVLESSMode(ctx, room, listenAddr)
+	}
+
+	return runJazzDataChannelMode(ctx, room, listenAddr)
 }
 
 func closeOnContextDone(ctx context.Context, closer io.Closer) {
@@ -2054,12 +2072,19 @@ func main() {
 
 	isDebug = opts.debug
 	telemost.SetDebug(opts.debug)
+	jazz.SetDebug(opts.debug)
 	manualCaptcha = opts.manualCaptcha
 	autoCaptchaSliderPOC = !manualCaptcha
 
-	if opts.telemostDC {
+	if opts.dc && opts.yalink != "" {
 		if err := runSelectedTelemostDataChannelMode(ctx, opts.yalink, opts.listen, opts.vlessMode); err != nil {
 			log.Fatalf("Telemost DataChannel mode failed: %v", err)
+		}
+		return
+	}
+	if opts.dc && opts.jazzRoom != "" {
+		if err := runSelectedJazzDataChannelMode(ctx, opts.jazzRoom, opts.listen, opts.vlessMode); err != nil {
+			log.Fatalf("SaluteJazz DataChannel mode failed: %v", err)
 		}
 		return
 	}
