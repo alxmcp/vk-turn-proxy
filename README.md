@@ -7,7 +7,6 @@
 ## Содержание
 
 - [Good TURN](#good-turn)
-  - [Режимы работы](#режимы-работы)
   - [Похожие проекты](#похожие-проекты)
     - [Server & Cli](#server--cli)
     - [Android](#android)
@@ -31,20 +30,13 @@
     - [Сервер (VPS)](#сервер-vps)
       - [Docker](#docker-1)
     - [Клиент](#клиент-1)
-  - [Telemost DataChannel](#telemost-datachannel)
-    - [Сервер](#сервер-1)
-    - [Клиент](#клиент-2)
-    - [VLESS через Telemost DataChannel](#vless-через-telemost-datachannel)
+  - [DataChannel](#datachannel)
+    - [Telemost сервер](#telemost-сервер)
+    - [Telemost клиент](#telemost-клиент)
+    - [SaluteJazz сервер](#salutejazz-сервер)
+    - [SaluteJazz клиент](#salutejazz-клиент)
   - [Direct mode](#direct-mode)
 
-## Режимы работы
-
-| Режим                                         | Клиент                          | Сервер                          | Полезная нагрузка      | Транспорт                                                                    |
-|-----------------------------------------------|---------------------------------|---------------------------------|------------------------|------------------------------------------------------------------------------|
-| VK TURN                                       | `-vk-link ...`                  | `-connect ...`                  | UDP-пакеты WireGuard   | TURN поверх TCP по умолчанию, либо UDP с `-udp`                              |
-| Telemost TURN _(не работает)_                 | `-yandex-link ...`              | `-connect ...`                  | UDP-пакеты WireGuard   | TURN поверх TCP по умолчанию, либо UDP с `-udp`; `-n` по умолчанию `1`       |
-| [VLESS](#vless-режим)                         | `-vless`                        | `-vless`                        | TCP-потоки             | TURN поверх TCP по умолчанию, либо UDP с `-udp`, дальше `DTLS -> KCP + smux` |
-| [Telemost DataChannel](#telemost-datachannel) | `-telemost-dc -yandex-link ...` | `-telemost-dc -yandex-link ...` | UDP или TCP (`-vless`) | WebRTC DataChannel, без TURN                                                 |
 
 ## Похожие проекты
 
@@ -576,40 +568,42 @@ Xray сервер (config.json)
 
 </details>
 
-## Telemost DataChannel
+## DataChannel
 
-Для Яндекс Телемоста теперь есть альтернативный режим без TURN: `-telemost-dc`.
+UPD: Яндекс Телемост не работает.
+
+Для Яндекс Телемоста и SaluteJazz теперь есть альтернативный режим без TURN: `-dc`.
 
 Режим работает как для обычного UDP/WireGuard-сценария, так и для `-vless`.
 
-### Сервер
+### Telemost сервер
 
 ```
-./server -connect 127.0.0.1:<порт WG> -yandex-link https://telemost.yandex.ru/j/... -telemost-dc
+./server -connect 127.0.0.1:<порт WG/VLESS> -yandex-link https://telemost.yandex.ru/j/... -dc
 ```
 
 Вместо ссылки можно использовать просто ID звонка, ссылка может быть `.ru` и `.com`.
 
-### Клиент
+### Telemost клиент
 
 ```
-./client -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc
+./client -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -dc
 ```
 
 В этом режиме флаг `-peer` не нужен: клиент и сервер встречаются внутри одной конференции Telemost по одной и той же ссылке.
 
-### VLESS через Telemost DataChannel
-
-Сервер:
+### SaluteJazz сервер
 
 ```
-./server -connect 127.0.0.1:<порт VLESS> -yandex-link https://telemost.yandex.ru/j/... -telemost-dc -vless
+./server -connect 127.0.0.1:<порт WG/VLESS> -jazz-room any -dc
 ```
 
-Клиент:
+Сервер создаёт комнату и пишет в лог `room:password`. Вместо `any` можно внести самому существующую комнату.
+
+### SaluteJazz клиент
 
 ```
-./client -listen 127.0.0.1:9000 -yandex-link https://telemost.yandex.ru/j/... -telemost-dc -vless
+./client -listen 127.0.0.1:9000 -jazz-room <room:password> -dc
 ```
 
 
