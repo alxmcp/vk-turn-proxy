@@ -75,22 +75,6 @@ func parseServerOptions(args []string, program string, stdout, stderr io.Writer)
 	})
 }
 
-func runSelectedTelemostDataChannelMode(ctx context.Context, inviteLink, connectAddr string, vlessMode bool) error {
-	if vlessMode {
-		return runTelemostDataChannelVLESSMode(ctx, inviteLink, connectAddr)
-	}
-
-	return runTelemostDataChannelMode(ctx, inviteLink, connectAddr)
-}
-
-func runSelectedJazzDataChannelMode(ctx context.Context, room, connectAddr string, vlessMode bool) error {
-	if vlessMode {
-		return runJazzDataChannelVLESSMode(ctx, room, connectAddr)
-	}
-
-	return runJazzDataChannelMode(ctx, room, connectAddr)
-}
-
 func closeOnContextDone(ctx context.Context, closer io.Closer) {
 	go func() {
 		<-ctx.Done()
@@ -119,15 +103,20 @@ func main() {
 	telemost.SetDebug(opts.debug)
 	jazz.SetDebug(opts.debug)
 
-	if opts.dc && opts.yalink != "" {
-		if err := runSelectedTelemostDataChannelMode(ctx, opts.yalink, opts.connect, opts.vlessMode); err != nil {
-			log.Fatalf("Telemost DataChannel mode failed: %v", err)
-		}
-		return
-	}
-	if opts.dc && opts.jazzRoom != "" {
-		if err := runSelectedJazzDataChannelMode(ctx, opts.jazzRoom, opts.connect, opts.vlessMode); err != nil {
-			log.Fatalf("SaluteJazz DataChannel mode failed: %v", err)
+	if opts.dc {
+		provider, err := cliutil.RunSelectedDataChannelMode(
+			ctx,
+			opts.yalink,
+			opts.jazzRoom,
+			opts.connect,
+			opts.vlessMode,
+			runTelemostDataChannelMode,
+			runTelemostDataChannelVLESSMode,
+			runJazzDataChannelMode,
+			runJazzDataChannelVLESSMode,
+		)
+		if err != nil {
+			log.Fatalf("%s DataChannel mode failed: %v", provider, err)
 		}
 		return
 	}

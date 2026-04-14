@@ -160,22 +160,6 @@ func parseClientOptions(args []string, program string, stdout, stderr io.Writer)
 	})
 }
 
-func runSelectedTelemostDataChannelMode(ctx context.Context, inviteLink, listenAddr string, vlessMode bool) error {
-	if vlessMode {
-		return runTelemostDataChannelVLESSMode(ctx, inviteLink, listenAddr)
-	}
-
-	return runTelemostDataChannelMode(ctx, inviteLink, listenAddr)
-}
-
-func runSelectedJazzDataChannelMode(ctx context.Context, room, listenAddr string, vlessMode bool) error {
-	if vlessMode {
-		return runJazzDataChannelVLESSMode(ctx, room, listenAddr)
-	}
-
-	return runJazzDataChannelMode(ctx, room, listenAddr)
-}
-
 func closeOnContextDone(ctx context.Context, closer io.Closer) {
 	go func() {
 		<-ctx.Done()
@@ -1817,6 +1801,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		return
 	}
 	turnServerAddr = turnServerUDPAddr.String()
+	fmt.Println(turnServerUDPAddr.IP)
 	var cfg *turn.ClientConfig
 	var turnConn net.PacketConn
 	var d net.Dialer
@@ -2076,15 +2061,20 @@ func main() {
 	manualCaptcha = opts.manualCaptcha
 	autoCaptchaSliderPOC = !manualCaptcha
 
-	if opts.dc && opts.yalink != "" {
-		if err := runSelectedTelemostDataChannelMode(ctx, opts.yalink, opts.listen, opts.vlessMode); err != nil {
-			log.Fatalf("Telemost DataChannel mode failed: %v", err)
-		}
-		return
-	}
-	if opts.dc && opts.jazzRoom != "" {
-		if err := runSelectedJazzDataChannelMode(ctx, opts.jazzRoom, opts.listen, opts.vlessMode); err != nil {
-			log.Fatalf("SaluteJazz DataChannel mode failed: %v", err)
+	if opts.dc {
+		provider, err := cliutil.RunSelectedDataChannelMode(
+			ctx,
+			opts.yalink,
+			opts.jazzRoom,
+			opts.listen,
+			opts.vlessMode,
+			runTelemostDataChannelMode,
+			runTelemostDataChannelVLESSMode,
+			runJazzDataChannelMode,
+			runJazzDataChannelVLESSMode,
+		)
+		if err != nil {
+			log.Fatalf("%s DataChannel mode failed: %v", provider, err)
 		}
 		return
 	}
@@ -2441,6 +2431,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		return nil, nil, fmt.Errorf("resolve TURN addr: %w", err)
 	}
 	turnServerAddr = turnServerUDPAddr.String()
+	fmt.Println(turnServerUDPAddr.IP)
 
 	// 2. Connect to TURN server
 	var turnConn net.PacketConn

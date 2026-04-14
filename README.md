@@ -49,12 +49,14 @@
 - https://github.com/kulikov0/whitelist-bypass - проброс через медиасервер SFU ВК и Яндекс Телемоста
 - https://github.com/NedgNDG/vk-proxy-auto-installer - автоустановщик VK TURN Proxy (TUI)
 
-### Android
-- https://github.com/MYSOREZ/vk-turn-proxy-android - клиент для андроида
-- https://github.com/WINGS-N/WINGSV - клиент для андроида с One UI, WireGuard, раздачей VPN с root
-- https://github.com/kiper292/wireguard-turn-android - клиент для андроида интегрированный в WireGuard
-- https://github.com/oxsidee/vkpn - клиент для андроида (кроссплатформенный Flutter)
+#### Android
+##### Мои любимые
 - https://github.com/samosvalishe/turn-proxy-android - клиент для андроида c Material 3 UI и автоапдейтами (Kotlin)
+- https://github.com/MYSOREZ/vk-turn-proxy-android - клиент для андроида
+- https://github.com/kiper292/wireguard-turn-android - клиент для андроида интегрированный в WireGuard
+##### Ещё
+- https://github.com/WINGS-N/WINGSV - клиент для андроида с One UI, WireGuard, раздачей VPN с root
+- https://github.com/oxsidee/vkpn - клиент для андроида (кроссплатформенный Flutter)
 - https://github.com/amurcanov/proxy-turn-vk-android - клиент для андроида с WireGuard
 
 ### iOS
@@ -581,6 +583,8 @@ UPD: Яндекс Телемост не работает.
 ```
 ./server -connect 127.0.0.1:<порт WG/VLESS> -yandex-link https://telemost.yandex.ru/j/... -dc
 ```
+
+Вместо ссылки можно использовать просто ID звонка, ссылка может быть `.ru` и `.com`.
 
 ### Telemost клиент
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cacggghp/vk-turn-proxy/internal/namegen"
+	"github.com/cacggghp/vk-turn-proxy/internal/rtcutil"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
@@ -166,27 +167,16 @@ func (p *Peer) WatchConnection(ctx context.Context) {
 func (p *Peer) Send(data []byte) error {
 	p.sessionMu.RLock()
 	session := p.session
-	p.sessionMu.RUnlock()
-
-	if session == nil || session.dc == nil || session.dc.ReadyState() != webrtc.DataChannelStateOpen {
-		return fmt.Errorf("datachannel not ready")
+	var dc *webrtc.DataChannel
+	if session != nil {
+		dc = session.dc
 	}
+	p.sessionMu.RUnlock()
 
 	p.sendMu.Lock()
 	defer p.sendMu.Unlock()
 
-	start := time.Now()
-	for session.dc.BufferedAmount() > 256*1024 {
-		if time.Since(start) > 2*time.Second {
-			return fmt.Errorf("datachannel buffer is full")
-		}
-		if session.dc.ReadyState() != webrtc.DataChannelStateOpen {
-			return fmt.Errorf("datachannel not ready")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	return session.dc.Send(data)
+	return rtcutil.SendDataChannel(dc, data)
 }
 
 func (p *Peer) Close() error {
@@ -329,10 +319,7 @@ func (p *Peer) connectOnce(ctx context.Context) error {
 	}
 	session.ws = ws
 
-	ws.SetPongHandler(func(string) error {
-		return ws.SetReadDeadline(time.Now().Add(60 * time.Second))
-	})
-	if err := ws.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+	if err := rtcutil.ConfigureWebSocketReadDeadline(ws, 60*time.Second); err != nil {
 		p.cleanupSession(session)
 		return err
 	}
