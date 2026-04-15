@@ -219,11 +219,7 @@ func (p *Peer) connectOnce(ctx context.Context) error {
 		return err
 	}
 
-	config := webrtc.Configuration{
-		ICEServers:   []webrtc.ICEServer{},
-		SDPSemantics: webrtc.SDPSemanticsUnifiedPlan,
-		BundlePolicy: webrtc.BundlePolicyMaxBundle,
-	}
+	config := jazzWebRTCConfiguration(nil)
 
 	api := webrtc.NewAPI()
 
@@ -313,6 +309,8 @@ func (p *Peer) connectOnce(ctx context.Context) error {
 		p.cleanupSession(session)
 		return err
 	}
+
+	p.setupICEHandlers(session)
 
 	p.sessionMu.Lock()
 	p.session = session
@@ -487,11 +485,7 @@ func (p *Peer) handleRTCConfig(session *peerSession, payload map[string]any) {
 		return
 	}
 
-	newConfig := webrtc.Configuration{
-		ICEServers:   iceServers,
-		SDPSemantics: webrtc.SDPSemanticsUnifiedPlan,
-		BundlePolicy: webrtc.BundlePolicyMaxBundle,
-	}
+	newConfig := jazzWebRTCConfiguration(iceServers)
 	if err := session.pcSub.SetConfiguration(newConfig); err != nil {
 		debugf("SaluteJazz subscriber SetConfiguration failed: %v", err)
 	}
@@ -532,7 +526,7 @@ func (p *Peer) handleSubscriberOffer(session *peerSession, payload map[string]an
 			"method": "rtc:answer",
 			"description": map[string]any{
 				"type": "answer",
-				"sdp":  answer.SDP,
+				"sdp":  localDescriptionSDP(session.pcSub, answer.SDP),
 			},
 		},
 	}); err != nil {
@@ -565,7 +559,7 @@ func (p *Peer) sendPublisherOffer(session *peerSession) {
 			"method": "rtc:offer",
 			"description": map[string]any{
 				"type": "offer",
-				"sdp":  offer.SDP,
+				"sdp":  localDescriptionSDP(session.pcPub, offer.SDP),
 			},
 		},
 	}); err != nil {
@@ -637,6 +631,84 @@ func (p *Peer) sendJoin(session *peerSession) error {
 			"isSilent": false,
 		},
 	})
+}
+
+func jazzWebRTCConfiguration(iceServers []webrtc.ICEServer) webrtc.Configuration {
+	return webrtc.Configuration{
+		ICEServers:         iceServers,
+		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
+		SDPSemantics:       webrtc.SDPSemanticsUnifiedPlan,
+		BundlePolicy:       webrtc.BundlePolicyMaxBundle,
+	}
+}
+
+func localDescriptionSDP(pc *webrtc.PeerConnection, fallback string) string {
+	if pc == nil {
+		return fallback
+	}
+	if desc := pc.LocalDescription(); desc != nil && desc.SDP != "" {
+		return desc.SDP
+	}
+	return fallback
+}
+
+func (p *Peer) setupICEHandlers(session *peerSession) {
+	session.pcSub.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		p.sendLocalICECandidate(session, "SUBSCRIBER", candidate)
+	})
+	session.pcPub.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		p.sendLocalICECandidate(session, "PUBLISHER", candidate)
+	})
+}
+
+func (p *Peer) sendLocalICECandidate(session *peerSession, candidateTarget string, candidate *webrtc.ICECandidate) {
+	if candidate == nil {
+		return
+	}
+	message, ok := localICECandidateMessage(session, candidateTarget, candidate.ToJSON())
+	if !ok {
+		debugf("SaluteJazz %s ICE candidate skipped: room, group, or candidate is missing", candidateTarget)
+		return
+	}
+	if err := p.writeJSON(session, message); err != nil && p.isCurrentSession(session) && !p.closed.Load() {
+		debugf("SaluteJazz %s ICE send failed: %v", candidateTarget, err)
+	}
+}
+
+func localICECandidateMessage(session *peerSession, candidateTarget string, candidate webrtc.ICECandidateInit) (map[string]any, bool) {
+	if session == nil || session.roomInfo == nil || session.roomInfo.RoomID == "" || session.groupID == "" ||
+		candidateTarget == "" || candidate.Candidate == "" {
+		return nil, false
+	}
+
+	sdpMid := ""
+	if candidate.SDPMid != nil {
+		sdpMid = *candidate.SDPMid
+	}
+
+	var sdpMLineIndex float64
+	if candidate.SDPMLineIndex != nil {
+		sdpMLineIndex = float64(*candidate.SDPMLineIndex)
+	}
+
+	return map[string]any{
+		"roomId":    session.roomInfo.RoomID,
+		"event":     "media-in",
+		"groupId":   session.groupID,
+		"requestId": uuid.New().String(),
+		"payload": map[string]any{
+			"method": "rtc:ice",
+			"rtcIceCandidates": []any{
+				map[string]any{
+					"candidate":        candidate.Candidate,
+					"sdpMid":           sdpMid,
+					"sdpMLineIndex":    sdpMLineIndex,
+					"usernameFragment": "",
+					"target":           candidateTarget,
+				},
+			},
+		},
+	}, true
 }
 
 func (p *Peer) writeJSON(session *peerSession, payload any) error {
