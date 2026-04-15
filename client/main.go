@@ -2449,7 +2449,11 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		cleanup()
 		return nil, nil, fmt.Errorf("KCP session: %w", err)
 	}
-	cleanupFns = append(cleanupFns, func() { _ = cleanupKCP() })
+	cleanupFns = append(cleanupFns, func() {
+		if err := cleanupKCP(); err != nil {
+			log.Printf("KCP cleanup error: %v", err)
+		}
+	})
 	log.Printf("KCP session established")
 
 	// 6. Create smux client session over KCP
